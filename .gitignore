@@ -1,4 +1,23 @@
 # =============================================================================
+# Android
+# =============================================================================
+*.iml
+.gradle
+/local.properties
+/.idea/caches
+/.idea/libraries
+/.idea/modules.xml
+/.idea/workspace.xml
+/.idea/navEditor.xml
+/.idea/assetWizardSettings.xml
+.DS_Store
+/build
+/captures
+.externalNativeBuild
+.cxx
+local.properties
+
+# =============================================================================
 # Dataset images — large, re-downloadable from Roboflow
 # Labels and COCO JSON annotations are kept (small, version-controlled)
 # =============================================================================
@@ -51,3 +70,4 @@ __pycache__/
 # Claude Code session memory (local tooling, not project code)
 # =============================================================================
 ml-training/.claude/
+.claude/
