@@ -11,6 +11,7 @@ import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
 import android.speech.tts.TextToSpeech
 import android.widget.Button
+import android.widget.TextView
 import androidx.activity.enableEdgeToEdge
 import androidx.appcompat.app.AppCompatActivity
 import androidx.camera.core.CameraSelector
@@ -33,12 +34,15 @@ class MainActivity : AppCompatActivity() {
     private lateinit var speechIntent: Intent
     private lateinit var previewView: PreviewView
     private lateinit var listenButton: Button
+    private lateinit var statusTextView: TextView
+    private lateinit var boundingBoxOverlay: BoundingBoxOverlay
     private lateinit var cameraExecutor: ExecutorService
 
-    private val audioFeedback = AudioFeedbackManager()
+    private lateinit var audioFeedback: AudioFeedbackManager
     private val objectDetector = ObjectDetector()
 
     @Volatile private var isSearching = false
+    private var currentTarget = ""
 
     companion object {
         private const val PERMISSION_REQUEST_CODE = 100
@@ -55,9 +59,12 @@ class MainActivity : AppCompatActivity() {
         enableEdgeToEdge()
         setContentView(R.layout.activity_main)
 
-        previewView   = findViewById(R.id.previewView)
-        listenButton  = findViewById(R.id.listenButton)
-        cameraExecutor = Executors.newSingleThreadExecutor()
+        previewView        = findViewById(R.id.previewView)
+        listenButton       = findViewById(R.id.listenButton)
+        statusTextView     = findViewById(R.id.statusTextView)
+        boundingBoxOverlay = findViewById(R.id.boundingBoxOverlay)
+        cameraExecutor     = Executors.newSingleThreadExecutor()
+        audioFeedback      = AudioFeedbackManager { msg -> speak(msg) }
 
         setupTts()
         setupSpeechRecognizer()
@@ -148,6 +155,14 @@ class MainActivity : AppCompatActivity() {
                         AudioFeedbackManager.DetectionResult(it.normalizedX, it.normalizedArea)
                     }
                 )
+                runOnUiThread {
+                    boundingBoxOverlay.updateDetection(result)
+                    statusTextView.text = if (result != null) {
+                        "${result.label} • ${"%.0f".format(result.confidence * 100)}%"
+                    } else {
+                        "Searching for $currentTarget\u2026"
+                    }
+                }
             }
         })
     }
@@ -206,11 +221,13 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun startSearching(target: String) {
+        currentTarget = target
         isSearching = true
         objectDetector.setTarget(target)
-        audioFeedback.start()
+        audioFeedback.start(target)
         speak("Searching for $target.")
         listenButton.text = getString(R.string.tap_to_stop)
+        statusTextView.text = "Searching for $target\u2026"
     }
 
     private fun stopSearching() {
@@ -218,6 +235,8 @@ class MainActivity : AppCompatActivity() {
         audioFeedback.stop()
         objectDetector.setTarget("")
         listenButton.text = getString(R.string.tap_to_speak)
+        statusTextView.text = getString(R.string.status_idle)
+        boundingBoxOverlay.updateDetection(null)
     }
 
     // ── Permissions ───────────────────────────────────────────────────────────

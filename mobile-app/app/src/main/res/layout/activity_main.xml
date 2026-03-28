@@ -6,7 +6,7 @@
     android:layout_width="match_parent"
     android:layout_height="match_parent">
 
-    <!-- Camera preview fills the full screen (visible for developer/testing) -->
+    <!-- Camera preview fills the full screen -->
     <androidx.camera.view.PreviewView
         android:id="@+id/previewView"
         android:layout_width="0dp"
@@ -17,9 +17,8 @@
         app:layout_constraintEnd_toEndOf="parent" />
 
     <!--
-        Full-screen tap target overlaid on the preview.
-        Semi-transparent so the camera feed remains visible during development.
-        The blind user only needs TTS + beeping — the button text is secondary.
+        Full-screen tap target. Kept very transparent so the camera feed and bounding box
+        overlay remain visible. The blind user relies on TTS + audio guidance, not the visuals.
     -->
     <Button
         android:id="@+id/listenButton"
@@ -28,9 +27,40 @@
         android:text="@string/tap_to_speak"
         android:textSize="24sp"
         android:textColor="@android:color/white"
-        app:backgroundTint="#99000000"
+        app:backgroundTint="#33000000"
         app:layout_constraintTop_toTopOf="parent"
         app:layout_constraintBottom_toBottomOf="parent"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintEnd_toEndOf="parent" />
+
+    <!--
+        Bounding box overlay — drawn on top of the button (later in XML = higher z-order).
+        Non-interactive so all touches fall through to the button beneath.
+    -->
+    <com.example.findme.BoundingBoxOverlay
+        android:id="@+id/boundingBoxOverlay"
+        android:layout_width="0dp"
+        android:layout_height="0dp"
+        android:clickable="false"
+        android:focusable="false"
+        app:layout_constraintTop_toTopOf="parent"
+        app:layout_constraintBottom_toBottomOf="parent"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintEnd_toEndOf="parent" />
+
+    <!-- Status bar — shows current pipeline state for the tester. -->
+    <TextView
+        android:id="@+id/statusTextView"
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:padding="10dp"
+        android:text="@string/status_idle"
+        android:textColor="@android:color/white"
+        android:textSize="16sp"
+        android:background="#AA000000"
+        android:clickable="false"
+        android:focusable="false"
+        app:layout_constraintTop_toTopOf="parent"
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintEnd_toEndOf="parent" />
 

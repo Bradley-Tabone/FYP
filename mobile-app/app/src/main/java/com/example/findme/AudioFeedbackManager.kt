@@ -1,28 +1,18 @@
 package com.example.findme
 
-import android.media.AudioAttributes
-import android.media.AudioFormat
-import android.media.AudioTrack
-import kotlin.math.PI
-import kotlin.math.sin
-
 /**
- * Produces continuous directional beeping to guide a blind user toward a detected object.
+ * Provides spoken English guidance to direct a user toward a detected object.
  *
- * Encoding:
- *   - Pitch (frequency): maps horizontal position of the object in the camera frame.
- *       Left edge  → 220 Hz (low)
- *       Centre     → 440 Hz (medium)
- *       Right edge → 880 Hz (high)
+ * Guidance is delivered via the [speak] callback, wired to TTS in MainActivity.
  *
- *   - Tempo (beep interval): maps how large/close the object appears in the frame.
- *       Small / far  → 1 200 ms between beeps (slow)
- *       Large / near →   100 ms between beeps (rapid)
- *
- * When no detection result is available (object not yet found) the manager plays a slow,
- * neutral 440 Hz pulse so the user knows the search is active.
+ * Behaviour:
+ *  - On the first frame where a detection appears, announces "Possible <target> found."
+ *  - While the object remains visible, periodically speaks direction (left/straight/right)
+ *    and proximity (far/closer/very close) every [GUIDANCE_INTERVAL_MS] ms.
+ *  - While the object is not visible, stays silent (the user already knows search is active
+ *    from the start announcement).
  */
-class AudioFeedbackManager {
+class AudioFeedbackManager(private val speak: (String) -> Unit) {
 
     data class DetectionResult(
         /** Horizontal centre of the bounding box: 0.0 = far left, 1.0 = far right. */
@@ -31,95 +21,73 @@ class AudioFeedbackManager {
         val normalizedArea: Float
     )
 
-    @Volatile private var currentResult: DetectionResult? = null
     @Volatile private var isRunning = false
-    private var beepThread: Thread? = null
+    @Volatile private var currentResult: DetectionResult? = null
+    @Volatile private var targetLabel: String = ""
+    @Volatile private var pendingFoundAnnouncement = false
 
-    private val sampleRate = 44100
+    private var guidanceThread: Thread? = null
 
-    fun start() {
+    companion object {
+        private const val GUIDANCE_INTERVAL_MS = 4000L
+    }
+
+    fun start(target: String) {
+        targetLabel = target
         if (isRunning) return
         isRunning = true
-        beepThread = Thread {
+        guidanceThread = Thread {
             while (isRunning) {
-                val result = currentResult
-                val frequencyHz = if (result != null) mapToFrequency(result.normalizedX) else 440f
-                val intervalMs  = if (result != null) mapToInterval(result.normalizedArea) else 1200L
-
-                playBeep(frequencyHz, durationMs = 80)
-
-                try {
-                    Thread.sleep(intervalMs)
-                } catch (e: InterruptedException) {
-                    break
+                if (pendingFoundAnnouncement) {
+                    pendingFoundAnnouncement = false
+                    speak("Possible $targetLabel found.")
+                    try { Thread.sleep(GUIDANCE_INTERVAL_MS) } catch (e: InterruptedException) { break }
+                    continue
                 }
+
+                val result = currentResult
+                if (result != null) {
+                    val direction = toDirection(result.normalizedX)
+                    val proximity = toProximity(result.normalizedArea)
+                    speak("$direction. $proximity.")
+                } else {
+                    speak("Scanning.")
+                }
+
+                try { Thread.sleep(GUIDANCE_INTERVAL_MS) } catch (e: InterruptedException) { break }
             }
         }.also { it.isDaemon = true; it.start() }
     }
 
     fun stop() {
         isRunning = false
-        beepThread?.interrupt()
-        beepThread = null
+        guidanceThread?.interrupt()
+        guidanceThread = null
         currentResult = null
+        pendingFoundAnnouncement = false
     }
 
     /** Call this from the detection callback to update direction/distance. Pass null when the
      *  target is not currently visible in the frame. */
     fun update(result: DetectionResult?) {
+        if (result != null && currentResult == null) {
+            pendingFoundAnnouncement = true
+        }
         currentResult = result
     }
 
-    // ── Mapping helpers ──────────────────────────────────────────────────────
+    // ── Guidance helpers ──────────────────────────────────────────────────────
 
-    /** 0.0 → 220 Hz,  0.5 → 550 Hz,  1.0 → 880 Hz (left-to-right). */
-    private fun mapToFrequency(normalizedX: Float): Float =
-        220f + normalizedX.coerceIn(0f, 1f) * 660f
+    private fun toDirection(normalizedX: Float): String = when {
+        normalizedX < 0.35f -> "Move left"
+        normalizedX > 0.65f -> "Move right"
+        else -> "Straight ahead"
+    }
 
-    /** Large area (close) → short interval (fast),  small area (far) → long interval (slow). */
-    private fun mapToInterval(normalizedArea: Float): Long =
-        (1200L - (normalizedArea.coerceIn(0f, 1f) * 1100).toLong()).coerceAtLeast(100L)
-
-    // ── Audio synthesis ───────────────────────────────────────────────────────
-
-    private fun playBeep(frequency: Float, durationMs: Int) {
-        val numSamples = sampleRate * durationMs / 1000
-        val buffer = ShortArray(numSamples) { i ->
-            val angle = 2.0 * PI * i * frequency / sampleRate
-            (sin(angle) * Short.MAX_VALUE * 0.6).toInt().toShort()
-        }
-
-        val bufferSizeBytes = buffer.size * Short.SIZE_BYTES
-        val audioTrack = AudioTrack.Builder()
-            .setAudioAttributes(
-                AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_ASSISTANCE_ACCESSIBILITY)
-                    .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
-                    .build()
-            )
-            .setAudioFormat(
-                AudioFormat.Builder()
-                    .setSampleRate(sampleRate)
-                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                    .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
-                    .build()
-            )
-            .setBufferSizeInBytes(bufferSizeBytes)
-            .setTransferMode(AudioTrack.MODE_STATIC)
-            .build()
-
-        audioTrack.write(buffer, 0, buffer.size)
-        audioTrack.play()
-        try {
-            Thread.sleep(durationMs.toLong())
-        } catch (e: InterruptedException) {
-            // Interrupted during playback — clean up and propagate
-            audioTrack.stop()
-            audioTrack.release()
-            Thread.currentThread().interrupt()
-            return
-        }
-        audioTrack.stop()
-        audioTrack.release()
+    private fun toProximity(normalizedArea: Float): String = when {
+        normalizedArea < 0.05f -> "Keep moving forward"
+        normalizedArea < 0.15f -> "Getting closer"
+        normalizedArea < 0.30f -> "Almost there"
+        else -> "Object is very close, stop"
     }
 }
