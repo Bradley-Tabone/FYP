@@ -14,8 +14,10 @@ import android.widget.Button
 import android.widget.TextView
 import androidx.activity.enableEdgeToEdge
 import androidx.appcompat.app.AppCompatActivity
+import androidx.camera.core.Camera
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
+import androidx.camera.core.ImageProxy
 import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
@@ -39,10 +41,17 @@ class MainActivity : AppCompatActivity() {
     private lateinit var cameraExecutor: ExecutorService
 
     private lateinit var audioFeedback: AudioFeedbackManager
-    private val objectDetector = ObjectDetector()
+
+    // ── Model switch — uncomment one pair, comment out the others ────────────
+    private val objectDetector = ObjectDetectorRFDETR()   // RF-DETR Base (rfdetr_base.onnx, 107 MB)
+    // private val objectDetector = ObjectDetectorRTDETR() // RT-DETR-l    (rtdetr_l.onnx,   125 MB)
+    // private val objectDetector = ObjectDetector()        // YOLO26n      (yolo26n.onnx,     9 MB)
 
     @Volatile private var isSearching = false
     private var currentTarget = ""
+
+    private var camera: Camera? = null
+    @Volatile private var isTorchOn = false
 
     companion object {
         private const val PERMISSION_REQUEST_CODE = 100
@@ -50,6 +59,10 @@ class MainActivity : AppCompatActivity() {
             Manifest.permission.CAMERA,
             Manifest.permission.RECORD_AUDIO
         )
+        // Hysteresis thresholds (0–255 luma scale).
+        // Wide gap is intentional: the torch itself raises luma, so a narrow gap causes flicker.
+        private const val TORCH_ON_LUMA  = 80   // turn torch on  when avg luma drops below this
+        private const val TORCH_OFF_LUMA = 170  // turn torch off when avg luma rises above this
     }
 
     // ── Lifecycle ─────────────────────────────────────────────────────────────
@@ -69,6 +82,7 @@ class MainActivity : AppCompatActivity() {
         setupTts()
         setupSpeechRecognizer()
         setupObjectDetector()
+        objectDetector.loadModel(this, "rfdetr_base.onnx") // swap file to match detector above
 
         listenButton.setOnClickListener { onListenButtonTapped() }
 
@@ -102,10 +116,12 @@ class MainActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
+        setTorch(false)
         tts.stop()
         tts.shutdown()
         speechRecognizer.destroy()
         audioFeedback.stop()
+        objectDetector.close()
         cameraExecutor.shutdown()
     }
 
@@ -147,12 +163,12 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun setupObjectDetector() {
-        objectDetector.setListener(object : ObjectDetector.Listener {
-            override fun onResult(result: ObjectDetector.DetectionResult?) {
+        objectDetector.setListener(object : DetectorContract.Listener {
+            override fun onResult(result: DetectorContract.DetectionResult?) {
                 if (!isSearching) return
                 audioFeedback.update(
                     result?.let {
-                        AudioFeedbackManager.DetectionResult(it.normalizedX, it.normalizedArea)
+                        AudioFeedbackManager.DetectionResult(it.normalizedX, it.normalizedArea, it.confidence)
                     }
                 )
                 runOnUiThread {
@@ -183,12 +199,13 @@ class MainActivity : AppCompatActivity() {
                 .build()
                 .also {
                     it.setAnalyzer(cameraExecutor) { imageProxy ->
+                        updateTorch(imageProxy)
                         objectDetector.analyze(imageProxy)
                     }
                 }
 
             cameraProvider.unbindAll()
-            cameraProvider.bindToLifecycle(
+            camera = cameraProvider.bindToLifecycle(
                 this,
                 CameraSelector.DEFAULT_BACK_CAMERA,
                 preview,
@@ -215,7 +232,7 @@ class MainActivity : AppCompatActivity() {
         when {
             command.contains("wallet")                              -> startSearching("wallet")
             command.contains("key")                                 -> startSearching("keys")
-            command.contains("glasses") || command.contains("spectacles") -> startSearching("glasses")
+            command.contains("glasses") || command.contains("spectacles") -> startSearching("sunglasses")
             else -> speak("Object not recognised. Please say wallet, keys, or glasses.")
         }
     }
@@ -234,6 +251,7 @@ class MainActivity : AppCompatActivity() {
         isSearching = false
         audioFeedback.stop()
         objectDetector.setTarget("")
+        setTorch(false)
         listenButton.text = getString(R.string.tap_to_speak)
         statusTextView.text = getString(R.string.status_idle)
         boundingBoxOverlay.updateDetection(null)
@@ -248,6 +266,48 @@ class MainActivity : AppCompatActivity() {
 
     private fun allPermissionsGranted() = REQUIRED_PERMISSIONS.all {
         ContextCompat.checkSelfPermission(this, it) == PackageManager.PERMISSION_GRANTED
+    }
+
+    // ── Torch / low-light ────────────────────────────────────────────────────
+
+    /**
+     * Called on the camera executor thread for every frame (before inference).
+     * Samples a sparse grid of Y-plane pixels to compute average luma, then
+     * enables or disables the torch with hysteresis to avoid rapid flickering.
+     * Does nothing when not actively searching.
+     */
+    private fun updateTorch(image: ImageProxy) {
+        if (!isSearching) return
+        val plane  = image.planes.getOrNull(0) ?: return
+        val buffer = plane.buffer
+        val stride = plane.rowStride
+        val w = image.width
+        val h = image.height
+
+        // Sample every 16th pixel — cheap but representative
+        var sum = 0L; var count = 0
+        var row = 0
+        while (row < h) {
+            var col = 0
+            while (col < w) {
+                val idx = row * stride + col
+                if (idx < buffer.limit()) { sum += buffer.get(idx).toInt() and 0xFF; count++ }
+                col += 16
+            }
+            row += 16
+        }
+        if (count == 0) return
+
+        val luma = (sum / count).toInt()
+        when {
+            !isTorchOn && luma < TORCH_ON_LUMA  -> setTorch(true)
+            isTorchOn  && luma > TORCH_OFF_LUMA -> setTorch(false)
+        }
+    }
+
+    private fun setTorch(on: Boolean) {
+        isTorchOn = on
+        camera?.cameraControl?.enableTorch(on)
     }
 
     // ── TTS helper ────────────────────────────────────────────────────────────

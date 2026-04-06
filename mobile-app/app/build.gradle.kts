@@ -33,6 +33,15 @@ android {
         sourceCompatibility = JavaVersion.VERSION_11
         targetCompatibility = JavaVersion.VERSION_11
     }
+
+    packaging {
+        jniLibs {
+            // Compress native libs so 16 KB page-size alignment is not required.
+            // ONNX Runtime's .so files are not yet 16 KB aligned; this is the
+            // standard workaround until the library produces aligned builds.
+            useLegacyPackaging = true
+        }
+    }
 }
 
 dependencies {
@@ -47,6 +56,9 @@ dependencies {
     implementation(libs.camera.camera2)
     implementation(libs.camera.lifecycle)
     implementation(libs.camera.view)
+
+    // ONNX Runtime — runs yolo26n.onnx on-device
+    implementation(libs.onnxruntime.android)
 
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.junit)

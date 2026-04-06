@@ -14,7 +14,7 @@ import kotlin.math.sqrt
  * Renders a bounding box and confidence label for the current detection result.
  * Non-interactive — touch events pass through to the button beneath.
  *
- * Call [updateDetection] from the main thread with each new [ObjectDetector.DetectionResult]
+ * Call [updateDetection] from the main thread with each new [DetectorContract.DetectionResult]
  * (or null to clear). The box coordinates are approximated from the normalised centre-point
  * and area, assuming a roughly square object.
  */
@@ -23,7 +23,7 @@ class BoundingBoxOverlay @JvmOverloads constructor(
     attrs: AttributeSet? = null
 ) : View(context, attrs) {
 
-    private var detection: ObjectDetector.DetectionResult? = null
+    private var detection: DetectorContract.DetectionResult? = null
 
     private val boxPaint = Paint().apply {
         color = Color.GREEN
@@ -44,7 +44,7 @@ class BoundingBoxOverlay @JvmOverloads constructor(
     }
 
     /** Update the displayed detection. Pass null to clear the overlay. Must be called on the main thread. */
-    fun updateDetection(result: ObjectDetector.DetectionResult?) {
+    fun updateDetection(result: DetectorContract.DetectionResult?) {
         detection = result
         invalidate()
     }
