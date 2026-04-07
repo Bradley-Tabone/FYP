@@ -37,8 +37,7 @@ ml-training/data/**/*.cache
 **/*.pt
 **/*.pth
 
-# Export formats
-**/*.onnx
+# Export formats — *.onnx tracked via Git LFS (see .gitattributes)
 **/*.tflite
 
 # RF-DETR run directory (3.6 GB — all training checkpoints)
@@ -65,3 +64,15 @@ __pycache__/
 *.pyc
 *.pyo
 .ipynb_checkpoints/
+
+# =============================================================================
+# Large data directories — images only; labels/annotations are tracked
+# =============================================================================
+ml-training/data_backup_pre_cull/
+ml-training/data_backup_post_cull/
+ml-training/sunglasses-wallet-keys-custom/
+ml-training/notebooks/runs/detect/*/train_batch*.jpg
+ml-training/notebooks/runs/detect/*/val_batch*.jpg
+ml-training/notebooks/runs/detect/*/labels.jpg
+ml-training/notebooks/runs/detect/runs/*/train_batch*.jpg
+ml-training/notebooks/runs/detect/runs/*/val_batch*.jpg

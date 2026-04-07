@@ -1,0 +1,13 @@
+train: ../train/images
+val: ../valid/images
+test: ../test/images
+
+nc: 1
+names: ['Sunglasses']
+
+roboflow:
+  workspace: fyp-13ahs
+  project: sunglasses-2jtbw-tzpcq
+  version: 1
+  license: CC BY 4.0
+  url: https://universe.roboflow.com/fyp-13ahs/sunglasses-2jtbw-tzpcq/dataset/1
