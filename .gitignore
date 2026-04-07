@@ -67,7 +67,8 @@ __pycache__/
 .ipynb_checkpoints/
 
 # =============================================================================
-# Claude Code session memory (local tooling, not project code)
+# Claude Code tooling — never commit
 # =============================================================================
 ml-training/.claude/
 .claude/
+CLAUDE.md
