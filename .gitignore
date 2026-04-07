@@ -65,10 +65,3 @@ __pycache__/
 *.pyc
 *.pyo
 .ipynb_checkpoints/
-
-# =============================================================================
-# Claude Code tooling — never commit
-# =============================================================================
-ml-training/.claude/
-.claude/
-CLAUDE.md
