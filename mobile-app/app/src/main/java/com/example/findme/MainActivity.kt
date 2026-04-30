@@ -16,9 +16,12 @@ import androidx.activity.enableEdgeToEdge
 import androidx.appcompat.app.AppCompatActivity
 import androidx.camera.core.Camera
 import androidx.camera.core.CameraSelector
+import android.util.Size
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
 import androidx.camera.core.Preview
+import androidx.camera.core.resolutionselector.ResolutionSelector
+import androidx.camera.core.resolutionselector.ResolutionStrategy
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.core.app.ActivityCompat
@@ -43,15 +46,20 @@ class MainActivity : AppCompatActivity() {
     private lateinit var audioFeedback: AudioFeedbackManager
 
     // ── Model switch — uncomment one pair, comment out the others ────────────
-    private val objectDetector = ObjectDetectorRFDETR()   // RF-DETR Base (rfdetr_base.onnx, 107 MB)
-    // private val objectDetector = ObjectDetectorRTDETR() // RT-DETR-l    (rtdetr_l.onnx,   125 MB)
-    // private val objectDetector = ObjectDetector()        // YOLO26n      (yolo26n.onnx,     9 MB)
+    // private val objectDetector = ObjectDetector()           // YOLO26s iter1 (yolo26s.tflite)
+    private val objectDetector = ObjectDetectorRTDETR()    // RT-DETR-l    (rtdetr_l.onnx)
+    // private val objectDetector = ObjectDetectorRFDETR()  // RF-DETR Nano  (rfdetr_nano.onnx)
 
     @Volatile private var isSearching = false
     private var currentTarget = ""
 
     private var camera: Camera? = null
     @Volatile private var isTorchOn = false
+
+    // Single-target tracker — replaces the old MISS_HOLD_FRAMES freeze with a
+    // constant-velocity predictor + confidence decay. Bridges short occlusions
+    // (~½ s) without holding a stale box during camera pans. See TargetTracker.kt.
+    private val tracker = TargetTracker()
 
     companion object {
         private const val PERMISSION_REQUEST_CODE = 100
@@ -63,6 +71,11 @@ class MainActivity : AppCompatActivity() {
         // Wide gap is intentional: the torch itself raises luma, so a narrow gap causes flicker.
         private const val TORCH_ON_LUMA  = 80   // turn torch on  when avg luma drops below this
         private const val TORCH_OFF_LUMA = 170  // turn torch off when avg luma rises above this
+
+        // ── Debug flag — set false to ship ───────────────────────────────────
+        // When true, the bounding box switches to the secondary class (e.g. glasses)
+        // if its confidence exceeds the primary class, so class confusion is visible.
+        private const val DEBUG_SECONDARY_BBOX = false
     }
 
     // ── Lifecycle ─────────────────────────────────────────────────────────────
@@ -82,7 +95,7 @@ class MainActivity : AppCompatActivity() {
         setupTts()
         setupSpeechRecognizer()
         setupObjectDetector()
-        objectDetector.loadModel(this, "rfdetr_base.onnx") // swap file to match detector above
+        objectDetector.loadModel(this, "rtdetr_s.onnx") // RT-DETR-s=rtdetr_s.onnx  RT-DETR-l=rtdetr_l.onnx  RF-DETR=rfdetr_nano.onnx  YOLO=yolo26s.tflite
 
         listenButton.setOnClickListener { onListenButtonTapped() }
 
@@ -166,15 +179,48 @@ class MainActivity : AppCompatActivity() {
         objectDetector.setListener(object : DetectorContract.Listener {
             override fun onResult(result: DetectorContract.DetectionResult?) {
                 if (!isSearching) return
+                val displayed = if (result != null) {
+                    tracker.onHit(result)
+                    tracker.current()
+                } else {
+                    // On a miss the tracker advances its predicted position by the
+                    // current velocity and decays confidence; returns null once it
+                    // has fallen below CONF_FLOOR (occlusion has lasted too long).
+                    tracker.onMiss()
+                }
+
+                // Debug: when secondary class is more confident, show its bbox instead
+                val secondaryResult = displayed?.debugSecondaryResult
+                val bboxToShow = if (DEBUG_SECONDARY_BBOX &&
+                        secondaryResult != null &&
+                        secondaryResult.confidence > (displayed?.confidence ?: 0f)) {
+                    secondaryResult
+                } else {
+                    displayed
+                }
+
                 audioFeedback.update(
-                    result?.let {
-                        AudioFeedbackManager.DetectionResult(it.normalizedX, it.normalizedArea, it.confidence)
+                    displayed?.let {
+                        AudioFeedbackManager.DetectionResult(
+                            normalizedX    = it.normalizedX,
+                            normalizedY    = it.normalizedY,
+                            normalizedArea = it.normalizedArea,
+                            confidence     = it.confidence,
+                            secondaryLabel = it.debugSecondaryLabel,
+                            secondaryConf  = it.debugSecondaryConf
+                        )
                     }
                 )
                 runOnUiThread {
-                    boundingBoxOverlay.updateDetection(result)
-                    statusTextView.text = if (result != null) {
-                        "${result.label} • ${"%.0f".format(result.confidence * 100)}%"
+                    boundingBoxOverlay.updateDetection(bboxToShow)
+                    statusTextView.text = if (displayed != null) {
+                        val primary = "${displayed.label} ${"%.0f".format(displayed.confidence * 100)}%"
+                        val secondary = displayed.debugSecondaryLabel?.let { lbl ->
+                            val conf = displayed.debugSecondaryConf
+                            if (conf != null) "  |  $lbl ${"%.0f".format(conf * 100)}%"
+                            else "  |  $lbl <30%"
+                        } ?: ""
+                        "$primary$secondary"
                     } else {
                         "Searching for $currentTarget\u2026"
                     }
@@ -194,8 +240,22 @@ class MainActivity : AppCompatActivity() {
                 it.setSurfaceProvider(previewView.surfaceProvider)
             }
 
+            // Cap analyzer frames to ~720p. The camera otherwise hands us full sensor
+            // resolution (~12 MP on the S23 Ultra), and toBitmap() pays a YUV→ARGB
+            // memcpy proportional to that. The model letterboxes to 320×320 anyway,
+            // so the extra pixels are pure overhead.
+            val analyzerResolution = ResolutionSelector.Builder()
+                .setResolutionStrategy(
+                    ResolutionStrategy(
+                        Size(720, 1280),
+                        ResolutionStrategy.FALLBACK_RULE_CLOSEST_LOWER_THEN_HIGHER
+                    )
+                )
+                .build()
+
             val imageAnalysis = ImageAnalysis.Builder()
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                .setResolutionSelector(analyzerResolution)
                 .build()
                 .also {
                     it.setAnalyzer(cameraExecutor) { imageProxy ->
@@ -230,9 +290,9 @@ class MainActivity : AppCompatActivity() {
 
     private fun handleCommand(command: String) {
         when {
-            command.contains("wallet")                              -> startSearching("wallet")
-            command.contains("key")                                 -> startSearching("keys")
-            command.contains("glasses") || command.contains("spectacles") -> startSearching("sunglasses")
+            command.contains("wallet")                                        -> startSearching("wallet")
+            command.contains("key")                                           -> startSearching("keys")
+            command.contains("glasses") || command.contains("spectacles")     -> startSearching("sunglasses")
             else -> speak("Object not recognised. Please say wallet, keys, or glasses.")
         }
     }
@@ -249,6 +309,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun stopSearching() {
         isSearching = false
+        tracker.reset()
         audioFeedback.stop()
         objectDetector.setTarget("")
         setTorch(false)
