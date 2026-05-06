@@ -46,6 +46,9 @@ ml-training/notebooks/runs/rfdetr/
 # Weights subdirectories inside each detect run (kept: plots, CSVs, args.yaml)
 ml-training/notebooks/runs/detect/*/weights/
 
+# TFLite export artefacts — SavedModel directories produced during export
+ml-training/notebooks/runs/detect/*/tflite_export/
+
 # =============================================================================
 # Downloaded pretrained model files in project root / notebooks dir
 # =============================================================================

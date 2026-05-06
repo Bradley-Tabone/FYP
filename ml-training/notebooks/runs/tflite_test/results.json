@@ -1,0 +1,17 @@
+[
+  {
+    "Model":"yolo26s.tflite",
+    "mAP50":0.9003,
+    "Mean IoU (TP)":0.8924,
+    "Precision":0.94,
+    "Recall":0.9263,
+    "F1":0.933,
+    "Inference (ms)":45.8,
+    "FPS":21.8,
+    "Size (MB)":38.2,
+    "AP50 Keys":0.9041,
+    "AP50 Sunglasses":0.9048,
+    "AP50 Wallet":0.8984,
+    "AP50 glasses":0.8939
+  }
+]

@@ -45,10 +45,7 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var audioFeedback: AudioFeedbackManager
 
-    // ── Model switch — uncomment one pair, comment out the others ────────────
-    // private val objectDetector = ObjectDetector()           // YOLO26s iter1 (yolo26s.tflite)
-    private val objectDetector = ObjectDetectorRTDETR()    // RT-DETR-l    (rtdetr_l.onnx)
-    // private val objectDetector = ObjectDetectorRFDETR()  // RF-DETR Nano  (rfdetr_nano.onnx)
+    private val objectDetector = ObjectDetector()
 
     @Volatile private var isSearching = false
     private var currentTarget = ""
@@ -71,11 +68,6 @@ class MainActivity : AppCompatActivity() {
         // Wide gap is intentional: the torch itself raises luma, so a narrow gap causes flicker.
         private const val TORCH_ON_LUMA  = 80   // turn torch on  when avg luma drops below this
         private const val TORCH_OFF_LUMA = 170  // turn torch off when avg luma rises above this
-
-        // ── Debug flag — set false to ship ───────────────────────────────────
-        // When true, the bounding box switches to the secondary class (e.g. glasses)
-        // if its confidence exceeds the primary class, so class confusion is visible.
-        private const val DEBUG_SECONDARY_BBOX = false
     }
 
     // ── Lifecycle ─────────────────────────────────────────────────────────────
@@ -95,7 +87,7 @@ class MainActivity : AppCompatActivity() {
         setupTts()
         setupSpeechRecognizer()
         setupObjectDetector()
-        objectDetector.loadModel(this, "rtdetr_s.onnx") // RT-DETR-s=rtdetr_s.onnx  RT-DETR-l=rtdetr_l.onnx  RF-DETR=rfdetr_nano.onnx  YOLO=yolo26s.tflite
+        objectDetector.loadModel(this, "yolo26n.tflite")
 
         listenButton.setOnClickListener { onListenButtonTapped() }
 
@@ -189,41 +181,22 @@ class MainActivity : AppCompatActivity() {
                     tracker.onMiss()
                 }
 
-                // Debug: when secondary class is more confident, show its bbox instead
-                val secondaryResult = displayed?.debugSecondaryResult
-                val bboxToShow = if (DEBUG_SECONDARY_BBOX &&
-                        secondaryResult != null &&
-                        secondaryResult.confidence > (displayed?.confidence ?: 0f)) {
-                    secondaryResult
-                } else {
-                    displayed
-                }
-
                 audioFeedback.update(
                     displayed?.let {
                         AudioFeedbackManager.DetectionResult(
                             normalizedX    = it.normalizedX,
                             normalizedY    = it.normalizedY,
                             normalizedArea = it.normalizedArea,
-                            confidence     = it.confidence,
-                            secondaryLabel = it.debugSecondaryLabel,
-                            secondaryConf  = it.debugSecondaryConf
+                            confidence     = it.confidence
                         )
                     }
                 )
                 runOnUiThread {
-                    boundingBoxOverlay.updateDetection(bboxToShow)
-                    statusTextView.text = if (displayed != null) {
-                        val primary = "${displayed.label} ${"%.0f".format(displayed.confidence * 100)}%"
-                        val secondary = displayed.debugSecondaryLabel?.let { lbl ->
-                            val conf = displayed.debugSecondaryConf
-                            if (conf != null) "  |  $lbl ${"%.0f".format(conf * 100)}%"
-                            else "  |  $lbl <30%"
-                        } ?: ""
-                        "$primary$secondary"
-                    } else {
+                    boundingBoxOverlay.updateDetection(displayed)
+                    statusTextView.text = if (displayed != null)
+                        "${displayed.label} ${"%.0f".format(displayed.confidence * 100)}%"
+                    else
                         "Searching for $currentTarget\u2026"
-                    }
                 }
             }
         })

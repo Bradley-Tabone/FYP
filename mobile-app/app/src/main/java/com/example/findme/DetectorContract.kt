@@ -1,10 +1,8 @@
 package com.example.findme
 
 /**
- * Shared result type and listener interface used by both [ObjectDetector] (YOLO)
- * and [ObjectDetectorRTDETR] (RT-DETR). MainActivity, BoundingBoxOverlay, and
- * AudioFeedbackManager all reference these types, so switching detectors only
- * requires changing the two lines in MainActivity marked "Model switch".
+ * Shared result type and listener interface used by [ObjectDetector].
+ * MainActivity, BoundingBoxOverlay, and AudioFeedbackManager all reference these types.
  */
 object DetectorContract {
 
@@ -16,7 +14,15 @@ object DetectorContract {
         /** Vertical centre: 0.0 = top edge, 1.0 = bottom edge. */
         val normalizedY: Float,
         /** Bounding box area as a fraction of the full frame area. */
-        val normalizedArea: Float
+        val normalizedArea: Float,
+        /** Box width as a fraction of frame width (0.0–1.0). */
+        val normalizedW: Float = 0f,
+        /** Box height as a fraction of frame height (0.0–1.0). */
+        val normalizedH: Float = 0f,
+        /** Source frame width in pixels (after rotation). Used to compute preview crop offset. */
+        val sourceW: Int = 0,
+        /** Source frame height in pixels (after rotation). Used to compute preview crop offset. */
+        val sourceH: Int = 0
     )
 
     interface Listener {

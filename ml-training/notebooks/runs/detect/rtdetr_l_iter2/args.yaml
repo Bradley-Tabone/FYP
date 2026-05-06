@@ -6,7 +6,7 @@ epochs: 100
 time: null
 patience: 30
 batch: 16
-imgsz: 640
+imgsz: 320
 save: true
 save_period: -1
 cache: false
@@ -106,4 +106,4 @@ auto_augment: randaugment
 erasing: 0.4
 cfg: null
 tracker: botsort.yaml
-save_dir: /home/bradtab/git/FYP/ml-training/notebooks/runs/detect/rtdetr_l_iter2
+save_dir: C:\Users\Bradley\git\FYP\ml-training\notebooks\runs\detect\rtdetr_l_iter2

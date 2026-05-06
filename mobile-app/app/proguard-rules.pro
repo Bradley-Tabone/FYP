@@ -19,3 +19,19 @@
 # If you keep the line number information, uncomment this to
 # hide the original source file name.
 #-renamesourcefileattribute SourceFile
+
+# ───────────────────────────────────────────────────────────────────────────
+# Keep rules for the on-device ML stack. R8 would otherwise strip native-
+# bridge classes whose only references are JNI / reflection from the .so
+# files, which crashes the app at first inference call ("class not found").
+# ───────────────────────────────────────────────────────────────────────────
+
+# TensorFlow Lite — the interpreter, GPU/NNAPI delegates, and op kernels
+# are looked up reflectively from native code.
+-keep class org.tensorflow.lite.** { *; }
+-keep interface org.tensorflow.lite.** { *; }
+-dontwarn org.tensorflow.lite.**
+
+# CameraX — uses reflection internally for some lifecycle / config classes.
+-keep class androidx.camera.** { *; }
+-dontwarn androidx.camera.**

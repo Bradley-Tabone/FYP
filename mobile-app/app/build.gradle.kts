@@ -22,7 +22,13 @@ android {
 
     buildTypes {
         release {
-            isMinifyEnabled = false
+            // R8 minification + resource shrinking. Strips dead code (unused
+            // TFLite ops, unused Kotlin stdlib classes, unused R-class entries)
+            // and obfuscates names — both shrink the APK noticeably. The
+            // -keep rules in proguard-rules.pro pin TFLite, ORT, and the
+            // CameraX/JNI entry points that are reflected at runtime.
+            isMinifyEnabled = true
+            isShrinkResources = true
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
@@ -37,8 +43,7 @@ android {
     packaging {
         jniLibs {
             // Compress native libs so 16 KB page-size alignment is not required.
-            // ONNX Runtime's .so files are not yet 16 KB aligned; this is the
-            // standard workaround until the library produces aligned builds.
+            // Kept as a safety net for third-party .so files that may not yet be aligned.
             useLegacyPackaging = true
         }
     }
@@ -57,8 +62,11 @@ dependencies {
     implementation(libs.camera.lifecycle)
     implementation(libs.camera.view)
 
-    // ONNX Runtime — runs yolo26n.onnx on-device
-    implementation(libs.onnxruntime.android)
+    // LiteRT — Google's successor to TFLite (same org.tensorflow.lite.* package names,
+    // API-compatible drop-in). Version 1.4.0 ships updated GPU kernels with broader op
+    // coverage and fixes the GpuDelegateFactory$Options packaging bug present in 1.0.x.
+    implementation(libs.litert)
+    implementation(libs.litert.gpu)
 
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.junit)

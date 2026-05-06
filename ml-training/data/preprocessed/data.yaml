@@ -1,0 +1,15 @@
+names:
+- Keys
+- Sunglasses
+- Wallet
+- glasses
+nc: 4
+roboflow:
+  license: CC BY 4.0
+  project: merged_dataset_v6
+  url: https://universe.roboflow.com/fyp-13ahs/merged_dataset_v6/dataset/1
+  version: 1
+  workspace: fyp-13ahs
+test: test/images
+train: train/images
+val: valid/images

@@ -15,8 +15,12 @@ import kotlin.math.sqrt
  * Non-interactive — touch events pass through to the button beneath.
  *
  * Call [updateDetection] from the main thread with each new [DetectorContract.DetectionResult]
- * (or null to clear). The box coordinates are approximated from the normalised centre-point
- * and area, assuming a roughly square object.
+ * (or null to clear). When normalizedW/H are provided the actual box shape is drawn;
+ * otherwise falls back to a square approximation from centre-point + area.
+ *
+ * The overlay accounts for PreviewView's FILL_CENTER scaling by using the source
+ * frame dimensions (sourceW/sourceH) from the detection result to compute the
+ * crop offset. This ensures the bounding box aligns with the visible preview.
  */
 class BoundingBoxOverlay @JvmOverloads constructor(
     context: Context,
@@ -53,15 +57,58 @@ class BoundingBoxOverlay @JvmOverloads constructor(
         super.onDraw(canvas)
         val result = detection ?: return
 
-        val w = width.toFloat()
-        val h = height.toFloat()
+        val viewW = width.toFloat()
+        val viewH = height.toFloat()
 
-        // Approximate box from centre + area, assuming a roughly square object.
-        val side   = sqrt(result.normalizedArea)
-        val left   = (result.normalizedX - side / 2f).coerceIn(0f, 1f) * w
-        val top    = (result.normalizedY - side / 2f).coerceIn(0f, 1f) * h
-        val right  = (result.normalizedX + side / 2f).coerceIn(0f, 1f) * w
-        val bottom = (result.normalizedY + side / 2f).coerceIn(0f, 1f) * h
+        // Use actual box width/height when available; fall back to square approximation.
+        val bw = if (result.normalizedW > 0f) result.normalizedW else sqrt(result.normalizedArea)
+        val bh = if (result.normalizedH > 0f) result.normalizedH else sqrt(result.normalizedArea)
+
+        // Compute FILL_CENTER crop offset.
+        // PreviewView scales the camera frame to fill the view and crops the excess.
+        // Model coordinates are in [0,1] of the full frame, but the view only shows
+        // the cropped centre. We map frame-normalised coords to view pixels correctly.
+        val left:   Float
+        val top:    Float
+        val right:  Float
+        val bottom: Float
+
+        if (result.sourceW > 0 && result.sourceH > 0) {
+            val frameAspect = result.sourceW.toFloat() / result.sourceH
+            val viewAspect  = viewW / viewH
+            val scale: Float
+            val ox: Float   // horizontal crop offset in view pixels
+            val oy: Float   // vertical   crop offset in view pixels
+
+            if (frameAspect > viewAspect) {
+                // Frame is wider than view → scaled to fill height, crop left/right
+                scale = viewH / result.sourceH
+                val scaledW = result.sourceW * scale
+                ox = (scaledW - viewW) / 2f
+                oy = 0f
+            } else {
+                // Frame is taller than view → scaled to fill width, crop top/bottom
+                scale = viewW / result.sourceW
+                val scaledH = result.sourceH * scale
+                ox = 0f
+                oy = (scaledH - viewH) / 2f
+            }
+
+            val scaledFrameW = result.sourceW * scale
+            val scaledFrameH = result.sourceH * scale
+
+            // Map normalised frame coords → view pixels
+            left   = ((result.normalizedX - bw / 2f) * scaledFrameW - ox).coerceIn(0f, viewW)
+            top    = ((result.normalizedY - bh / 2f) * scaledFrameH - oy).coerceIn(0f, viewH)
+            right  = ((result.normalizedX + bw / 2f) * scaledFrameW - ox).coerceIn(0f, viewW)
+            bottom = ((result.normalizedY + bh / 2f) * scaledFrameH - oy).coerceIn(0f, viewH)
+        } else {
+            // Fallback: no source dimensions → assume 1:1 mapping (legacy behaviour)
+            left   = (result.normalizedX - bw / 2f).coerceIn(0f, 1f) * viewW
+            top    = (result.normalizedY - bh / 2f).coerceIn(0f, 1f) * viewH
+            right  = (result.normalizedX + bw / 2f).coerceIn(0f, 1f) * viewW
+            bottom = (result.normalizedY + bh / 2f).coerceIn(0f, 1f) * viewH
+        }
 
         canvas.drawRect(left, top, right, bottom, boxPaint)
 

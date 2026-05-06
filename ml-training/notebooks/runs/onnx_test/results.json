@@ -1,0 +1,44 @@
+[
+  {
+    "Model":"YOLO26n (iter3)",
+    "mAP50":0.7192,
+    "Mean IoU (TP)":0.8705,
+    "Precision":0.9497,
+    "Recall":0.7518,
+    "F1":0.834,
+    "Inference (ms)":22.3,
+    "FPS":44.8,
+    "AP50 Keys":0.8,
+    "AP50 Sunglasses":0.6306,
+    "AP50 Wallet":0.8097,
+    "AP50 glasses":0.6364
+  },
+  {
+    "Model":"RT-DETR-l",
+    "mAP50":0.735,
+    "Mean IoU (TP)":0.8612,
+    "Precision":0.9477,
+    "Recall":0.7638,
+    "F1":0.8395,
+    "Inference (ms)":106.9,
+    "FPS":9.4,
+    "AP50 Keys":0.8733,
+    "AP50 Sunglasses":0.6306,
+    "AP50 Wallet":0.8,
+    "AP50 glasses":0.6364
+  },
+  {
+    "Model":"RF-DETR Nano (iter2)",
+    "mAP50":0.6493,
+    "Mean IoU (TP)":0.8904,
+    "Precision":0.9681,
+    "Recall":0.6645,
+    "F1":0.7837,
+    "Inference (ms)":74.7,
+    "FPS":13.4,
+    "AP50 Keys":0.7038,
+    "AP50 Sunglasses":0.543,
+    "AP50 Wallet":0.7139,
+    "AP50 glasses":0.6364
+  }
+]
