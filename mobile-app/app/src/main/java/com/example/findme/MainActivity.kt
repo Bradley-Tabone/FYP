@@ -10,6 +10,7 @@ import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
 import android.speech.tts.TextToSpeech
+import android.view.WindowManager
 import android.widget.Button
 import android.widget.TextView
 import androidx.activity.enableEdgeToEdge
@@ -18,7 +19,6 @@ import androidx.camera.core.Camera
 import androidx.camera.core.CameraSelector
 import android.util.Size
 import androidx.camera.core.ImageAnalysis
-import androidx.camera.core.ImageProxy
 import androidx.camera.core.Preview
 import androidx.camera.core.resolutionselector.ResolutionSelector
 import androidx.camera.core.resolutionselector.ResolutionStrategy
@@ -44,18 +44,25 @@ class MainActivity : AppCompatActivity() {
     private lateinit var cameraExecutor: ExecutorService
 
     private lateinit var audioFeedback: AudioFeedbackManager
+    private lateinit var motionDetector: MotionDetector
+    private lateinit var orientationTracker: OrientationTracker
 
     private val objectDetector = ObjectDetector()
+
+    private val uiHandler = Handler(Looper.getMainLooper())
+    private val startListeningRunnable = Runnable { speechRecognizer.startListening(speechIntent) }
 
     @Volatile private var isSearching = false
     private var currentTarget = ""
 
     private var camera: Camera? = null
     @Volatile private var isTorchOn = false
+    @Volatile private var smoothedTorchLuma = Float.NaN
+    @Volatile private var torchDarkSinceMs = 0L
+    @Volatile private var torchBrightSinceMs = 0L
+    @Volatile private var torchTurnedOnAtMs = 0L
 
-    // Single-target tracker — replaces the old MISS_HOLD_FRAMES freeze with a
-    // constant-velocity predictor + confidence decay. Bridges short occlusions
-    // (~½ s) without holding a stale box during camera pans. See TargetTracker.kt.
+    // Smooths the visible box during very short missed detections.
     private val tracker = TargetTracker()
 
     companion object {
@@ -64,13 +71,19 @@ class MainActivity : AppCompatActivity() {
             Manifest.permission.CAMERA,
             Manifest.permission.RECORD_AUDIO
         )
-        // Hysteresis thresholds (0–255 luma scale).
-        // Wide gap is intentional: the torch itself raises luma, so a narrow gap causes flicker.
-        private const val TORCH_ON_LUMA  = 80   // turn torch on  when avg luma drops below this
-        private const val TORCH_OFF_LUMA = 170  // turn torch off when avg luma rises above this
+        /*
+         * Torch brightness values use luma: 0 is dark, 255 is bright.
+         * The timing constants stop the torch flickering on borderline frames.
+         */
+        private const val TORCH_ON_LUMA = 75
+        private const val TORCH_OFF_LUMA = 180
+        private const val TORCH_LUMA_ALPHA = 0.20f
+        private const val TORCH_ON_REQUIRED_MS = 600L
+        private const val TORCH_OFF_REQUIRED_MS = 3_000L
+        private const val MIN_TORCH_ON_MS = 8_000L
     }
 
-    // ── Lifecycle ─────────────────────────────────────────────────────────────
+    // Lifecycle
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -83,11 +96,27 @@ class MainActivity : AppCompatActivity() {
         boundingBoxOverlay = findViewById(R.id.boundingBoxOverlay)
         cameraExecutor     = Executors.newSingleThreadExecutor()
         audioFeedback      = AudioFeedbackManager { msg -> speak(msg) }
+        motionDetector     = MotionDetector(applicationContext) { state ->
+            audioFeedback.updateMotion(state)
+        }
+        orientationTracker = OrientationTracker(applicationContext) { yaw ->
+            audioFeedback.updateOrientation(yaw)
+        }
 
         setupTts()
         setupSpeechRecognizer()
         setupObjectDetector()
-        objectDetector.loadModel(this, "yolo26n.tflite")
+
+        /*
+         * Load the model in the camera executor and keep the listen button disabled
+         * until the model is ready.
+         */
+        listenButton.isEnabled = false
+        cameraExecutor.execute {
+            objectDetector.loadModel(applicationContext, "yolo26n.tflite")
+            // Only re-enable the button if the activity still exists.
+            runOnUiThread { if (!isDestroyed) listenButton.isEnabled = true }
+        }
 
         listenButton.setOnClickListener { onListenButtonTapped() }
 
@@ -119,18 +148,37 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    override fun onPause() {
+        uiHandler.removeCallbacks(startListeningRunnable)
+        if (isSearching) stopSearching()
+        speechRecognizer.cancel()
+        setTorch(false)
+        setKeepScreenAwake(false)
+        motionDetector.stop()
+        orientationTracker.stop()
+        super.onPause()
+    }
+
     override fun onDestroy() {
         super.onDestroy()
+        uiHandler.removeCallbacks(startListeningRunnable)
         setTorch(false)
+        setKeepScreenAwake(false)
         tts.stop()
         tts.shutdown()
         speechRecognizer.destroy()
         audioFeedback.stop()
-        objectDetector.close()
+        motionDetector.stop()
+        orientationTracker.stop()
+        /*
+         * Close the detector on the same executor so cleanup waits behind any
+         * model-loading work already queued.
+         */
+        cameraExecutor.execute { objectDetector.close() }
         cameraExecutor.shutdown()
     }
 
-    // ── Setup helpers ─────────────────────────────────────────────────────────
+    // Setup helpers
 
     private fun setupTts() {
         tts = TextToSpeech(this) { status ->
@@ -152,10 +200,18 @@ class MainActivity : AppCompatActivity() {
                     ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                     ?.get(0)
                     ?.lowercase()
-                if (spoken != null) handleCommand(spoken)
-            }
-            override fun onError(error: Int) {
-                speak("Sorry, I did not catch that. Please try again.")
+            if (spoken != null) handleCommand(spoken)
+        }
+        override fun onError(error: Int) {
+                when (error) {
+                    SpeechRecognizer.ERROR_NO_MATCH,
+                    SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> speak("I did not catch that. Please try again.")
+                    SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> speak("Microphone permission is needed to listen.")
+                    SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> {
+                        speechRecognizer.cancel()
+                    }
+                    else -> speak("Listening did not work. Please try again.")
+                }
             }
             override fun onReadyForSpeech(params: Bundle?) {}
             override fun onBeginningOfSpeech() {}
@@ -168,33 +224,40 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun setupObjectDetector() {
-        objectDetector.setListener(object : DetectorContract.Listener {
-            override fun onResult(result: DetectorContract.DetectionResult?) {
+        objectDetector.setListener(object : DetectorTypes.Listener {
+            override fun onLuma(luma: Int) {
+                // Use frame brightness from ObjectDetector to control the torch while searching.
                 if (!isSearching) return
+                updateTorchFromLuma(luma, System.currentTimeMillis())
+            }
+
+            override fun onResult(result: DetectorTypes.DetectionResult?) {
+                if (!isSearching) return
+                val audioResult = result?.let {
+                    AudioFeedbackManager.DetectionResult(
+                        normalizedX    = it.normalizedX,
+                        normalizedY    = it.normalizedY,
+                        normalizedArea = it.normalizedArea,
+                        confidence     = it.confidence
+                    )
+                }
                 val displayed = if (result != null) {
                     tracker.onHit(result)
                     tracker.current()
                 } else {
-                    // On a miss the tracker advances its predicted position by the
-                    // current velocity and decays confidence; returns null once it
-                    // has fallen below CONF_FLOOR (occlusion has lasted too long).
+                    // If the detector misses, let the tracker predict briefly before clearing the box.
                     tracker.onMiss()
                 }
 
-                audioFeedback.update(
-                    displayed?.let {
-                        AudioFeedbackManager.DetectionResult(
-                            normalizedX    = it.normalizedX,
-                            normalizedY    = it.normalizedY,
-                            normalizedArea = it.normalizedArea,
-                            confidence     = it.confidence
-                        )
-                    }
-                )
+                /*
+                 * Audio uses only real detections.
+                 * The overlay may show tracker predictions, but speech should not follow stale boxes.
+                 */
+                audioFeedback.update(audioResult)
                 runOnUiThread {
                     boundingBoxOverlay.updateDetection(displayed)
                     statusTextView.text = if (displayed != null)
-                        "${displayed.label} ${"%.0f".format(displayed.confidence * 100)}%"
+                        "${displayed.label} ${(displayed.confidence * 100).toInt()}%"
                     else
                         "Searching for $currentTarget\u2026"
                 }
@@ -202,7 +265,7 @@ class MainActivity : AppCompatActivity() {
         })
     }
 
-    // ── Camera ────────────────────────────────────────────────────────────────
+    // Camera
 
     private fun startCamera() {
         val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
@@ -213,10 +276,10 @@ class MainActivity : AppCompatActivity() {
                 it.setSurfaceProvider(previewView.surfaceProvider)
             }
 
-            // Cap analyzer frames to ~720p. The camera otherwise hands us full sensor
-            // resolution (~12 MP on the S23 Ultra), and toBitmap() pays a YUV→ARGB
-            // memcpy proportional to that. The model letterboxes to 320×320 anyway,
-            // so the extra pixels are pure overhead.
+            /*
+             * Keep analysis near 720p so frame decoding stays cheaper.
+             * The model input is only 640x640, so much larger frames add overhead.
+             */
             val analyzerResolution = ResolutionSelector.Builder()
                 .setResolutionStrategy(
                     ResolutionStrategy(
@@ -231,8 +294,8 @@ class MainActivity : AppCompatActivity() {
                 .setResolutionSelector(analyzerResolution)
                 .build()
                 .also {
+                    // ObjectDetector also reports brightness, so no extra luma scan is needed here.
                     it.setAnalyzer(cameraExecutor) { imageProxy ->
-                        updateTorch(imageProxy)
                         objectDetector.analyze(imageProxy)
                     }
                 }
@@ -247,7 +310,7 @@ class MainActivity : AppCompatActivity() {
         }, ContextCompat.getMainExecutor(this))
     }
 
-    // ── User interaction ──────────────────────────────────────────────────────
+    // User interaction
 
     private fun onListenButtonTapped() {
         if (isSearching) {
@@ -256,9 +319,7 @@ class MainActivity : AppCompatActivity() {
             return
         }
         speak("Listening")
-        Handler(Looper.getMainLooper()).postDelayed({
-            speechRecognizer.startListening(speechIntent)
-        }, 1000)
+        uiHandler.postDelayed(startListeningRunnable, 1000)
     }
 
     private fun handleCommand(command: String) {
@@ -273,8 +334,11 @@ class MainActivity : AppCompatActivity() {
     private fun startSearching(target: String) {
         currentTarget = target
         isSearching = true
+        setKeepScreenAwake(true)
         objectDetector.setTarget(target)
         audioFeedback.start(target)
+        motionDetector.start()
+        orientationTracker.start()
         speak("Searching for $target.")
         listenButton.text = getString(R.string.tap_to_stop)
         statusTextView.text = "Searching for $target\u2026"
@@ -284,14 +348,33 @@ class MainActivity : AppCompatActivity() {
         isSearching = false
         tracker.reset()
         audioFeedback.stop()
+        motionDetector.stop()
+        orientationTracker.stop()
         objectDetector.setTarget("")
         setTorch(false)
+        setKeepScreenAwake(false)
         listenButton.text = getString(R.string.tap_to_speak)
         statusTextView.text = getString(R.string.status_idle)
         boundingBoxOverlay.updateDetection(null)
     }
 
-    // ── Permissions ───────────────────────────────────────────────────────────
+    private fun setKeepScreenAwake(awake: Boolean) {
+        val updateFlag = {
+            if (awake) {
+                window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            } else {
+                window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            }
+        }
+
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            updateFlag()
+        } else {
+            runOnUiThread(updateFlag)
+        }
+    }
+
+    // Permissions
 
     private fun onPermissionsReady() {
         startCamera()
@@ -302,49 +385,68 @@ class MainActivity : AppCompatActivity() {
         ContextCompat.checkSelfPermission(this, it) == PackageManager.PERMISSION_GRANTED
     }
 
-    // ── Torch / low-light ────────────────────────────────────────────────────
+    // Torch / low-light
 
-    /**
-     * Called on the camera executor thread for every frame (before inference).
-     * Samples a sparse grid of Y-plane pixels to compute average luma, then
-     * enables or disables the torch with hysteresis to avoid rapid flickering.
-     * Does nothing when not actively searching.
+    /*
+     * Uses smoothed frame brightness to turn the torch on or off.
+     * Timing checks stop the torch flickering in borderline lighting.
      */
-    private fun updateTorch(image: ImageProxy) {
-        if (!isSearching) return
-        val plane  = image.planes.getOrNull(0) ?: return
-        val buffer = plane.buffer
-        val stride = plane.rowStride
-        val w = image.width
-        val h = image.height
-
-        // Sample every 16th pixel — cheap but representative
-        var sum = 0L; var count = 0
-        var row = 0
-        while (row < h) {
-            var col = 0
-            while (col < w) {
-                val idx = row * stride + col
-                if (idx < buffer.limit()) { sum += buffer.get(idx).toInt() and 0xFF; count++ }
-                col += 16
-            }
-            row += 16
+    private fun updateTorchFromLuma(luma: Int, now: Long) {
+        smoothedTorchLuma = if (smoothedTorchLuma.isNaN()) {
+            luma.toFloat()
+        } else {
+            smoothedTorchLuma * (1f - TORCH_LUMA_ALPHA) + luma * TORCH_LUMA_ALPHA
         }
-        if (count == 0) return
 
-        val luma = (sum / count).toInt()
-        when {
-            !isTorchOn && luma < TORCH_ON_LUMA  -> setTorch(true)
-            isTorchOn  && luma > TORCH_OFF_LUMA -> setTorch(false)
+        if (!isTorchOn) {
+            torchBrightSinceMs = 0L
+            if (smoothedTorchLuma < TORCH_ON_LUMA) {
+                if (torchDarkSinceMs == 0L) torchDarkSinceMs = now
+                if (now - torchDarkSinceMs >= TORCH_ON_REQUIRED_MS) {
+                    setTorch(true, now)
+                }
+            } else {
+                torchDarkSinceMs = 0L
+            }
+            return
+        }
+
+        torchDarkSinceMs = 0L
+        if (now - torchTurnedOnAtMs < MIN_TORCH_ON_MS) {
+            torchBrightSinceMs = 0L
+            return
+        }
+
+        if (smoothedTorchLuma > TORCH_OFF_LUMA) {
+            if (torchBrightSinceMs == 0L) torchBrightSinceMs = now
+            if (now - torchBrightSinceMs >= TORCH_OFF_REQUIRED_MS) {
+                setTorch(false, now)
+            }
+        } else {
+            torchBrightSinceMs = 0L
         }
     }
 
-    private fun setTorch(on: Boolean) {
+    private fun setTorch(on: Boolean, now: Long = System.currentTimeMillis()) {
         isTorchOn = on
+        if (on) {
+            torchTurnedOnAtMs = now
+            torchDarkSinceMs = 0L
+            torchBrightSinceMs = 0L
+        } else {
+            resetTorchTiming()
+        }
         camera?.cameraControl?.enableTorch(on)
     }
 
-    // ── TTS helper ────────────────────────────────────────────────────────────
+    private fun resetTorchTiming() {
+        smoothedTorchLuma = Float.NaN
+        torchDarkSinceMs = 0L
+        torchBrightSinceMs = 0L
+        torchTurnedOnAtMs = 0L
+    }
+
+    // TTS helper
 
     private fun speak(message: String) {
         tts.speak(message, TextToSpeech.QUEUE_FLUSH, null, null)

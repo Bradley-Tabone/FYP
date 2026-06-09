@@ -1,282 +1,646 @@
 package com.example.findme
 
-import kotlin.math.*
+import kotlin.math.PI
+import kotlin.math.abs
+import kotlin.math.pow
+import kotlin.math.roundToInt
+import kotlin.math.sqrt
 
-/**
- * Provides spoken English guidance to direct a blind user toward a detected object.
- *
- * Guidance is delivered via the [speak] callback, wired to TTS in MainActivity.
- *
- * Direction model — **horizontal clock + vertical cue**:
- *   The camera only sees forward, so clock hours are limited to the forward arc
- *   (9 through 12 through 3). normalizedX maps linearly to this range.
- *   When the object is near the frame centre, guidance says "directly ahead".
- *
- *   Vertical position (normalizedY) drives separate cues: "above you",
- *   "below you", "on the surface to your left/right", "reach down".
- *   These are more useful than clock hours 4-7 (which would wrongly imply
- *   "behind you" to the user).
- *
- * Proximity — **arm's-reach aware**:
- *   Thresholds are tuned so "within arm's reach" fires at a comfortable
- *   reaching distance (~60 cm), not when the phone is touching the object.
- *
- * Detection commitment:
- *   Once a high-confidence detection is confirmed, the manager *commits* to
- *   that position. If a new detection appears far from the committed spot
- *   (likely a false positive or a different object), it is ignored for up to
- *   [FAR_FRAMES_TO_SWITCH] consecutive frames. This prevents the user from
- *   being pulled away from the real object by a momentary false positive
- *   during a walk-by. If the far detection persists, it is accepted as a
- *   genuine new find.
+/*
+ * Turns detector and sensor information into short spoken navigation messages.
+ * It speaks from real detections, and only uses memory when the target was
+ * seen recently and then leaves the camera view.
  */
 class AudioFeedbackManager(private val speak: (String) -> Unit) {
 
     data class DetectionResult(
-        /** Horizontal centre of the bounding box: 0.0 = far left, 1.0 = far right. */
+        // Horizontal box centre: 0.0 is left, 1.0 is right.
         val normalizedX: Float,
-        /** Vertical centre of the bounding box: 0.0 = top edge, 1.0 = bottom edge. */
+        // Vertical box centre: 0.0 is top, 1.0 is bottom.
         val normalizedY: Float,
-        /** Bounding-box area as a fraction of the total frame area: 0.0 = tiny, 1.0 = fills frame. */
+        // Box area compared with the whole camera frame.
         val normalizedArea: Float,
-        /** Detection confidence: 0.0 = uncertain, 1.0 = certain. */
+        // Model confidence: 0.0 is unsure, 1.0 is very sure.
         val confidence: Float
     )
 
-    @Volatile private var isRunning = false
-    @Volatile private var currentResult: DetectionResult? = null
-    @Volatile private var targetLabel: String = ""
-    @Volatile private var pendingFoundAnnouncement = false
-    @Volatile private var everDetected = false
-    @Volatile private var isConfirmed = false
-    @Volatile private var lastConfirmedResult: DetectionResult? = null
-    @Volatile private var lostSightAnnounced = false
+    internal enum class GuidancePhase {
+        ALIGNING,
+        APPROACHING,
+        SURFACE,
+        ARRIVED,
+        REJECTED,
+        PACE_TOO_FAST,
+        PACE_TOO_SLOW,
+        BEARING_HINT
+    }
 
-    // Detection commitment — prevents jumping to distant false positives
+    /*
+     * Last known phone direction and screen position from a real detection.
+     * This helps give a clock direction if the target leaves the frame.
+     */
+    private data class BearingMemory(
+        val storedYawRad: Float,
+        val storedFrameX: Float,
+        val storedAtMs: Long
+    )
+
+    internal data class GuidanceDecision(
+        val phase: GuidancePhase,
+        val message: String,
+        // Clock-hour used only for bearing hints.
+        val bearingHour: Int? = null
+    )
+
+    @Volatile private var isRunning = false
+    @Volatile private var targetLabel: String = ""
+    @Volatile private var currentResult: DetectionResult? = null
+    @Volatile private var consecutiveCenteredLargeFrames = 0
+    @Volatile private var consecutiveRejectableCloseFrames = 0
+    @Volatile private var lastVisibleAtMs = 0L
+    @Volatile private var rejectableCandidateArmed = false
+    @Volatile private var rejectableCandidateLostAtMs = 0L
+    @Volatile private var rejectionSpokenForLostCandidate = false
+
+    /*
+     * Latest movement state from MotionDetector.
+     * The neutral default avoids pace warnings before sensor data arrives.
+     */
+    @Volatile private var motionState: MotionDetector.MotionState =
+        MotionDetector.MotionState.MOVING
+    @Volatile private var searchStartedAtMs = 0L
+
+    /*
+     * Last remembered target direction and latest phone yaw.
+     * If yaw is NaN, orientation data is not ready yet.
+     */
+    @Volatile private var bearingMemory: BearingMemory? = null
+    @Volatile private var currentYawRad: Float = Float.NaN
+    private var lastBearingSpokenHour: Int = -1
+    private var lastBearingSpokenAtMs: Long = 0L
+    private var lastPaceSlowSpokenAtMs: Long = 0L
+
+    /*
+     * Trusted screen position for speech.
+     * One-frame jumps are ignored, but repeated new positions are accepted.
+     */
     @Volatile private var committedX = Float.NaN
     @Volatile private var committedY = Float.NaN
     @Volatile private var consecutiveFarFrames = 0
 
+    private var lastSpoken = ""
+    private var lastSpokenAtMs = 0L
     private var guidanceThread: Thread? = null
 
     companion object {
-        private const val GUIDANCE_INTERVAL_MS        = 4000L
-        private const val SWEEP_REMINDER_INTERVAL_MS  = 6000L
-        private const val CONFIRMATION_THRESHOLD      = 0.80f
+        private const val INITIAL_GUIDANCE_DELAY_MS = 1_500L
+        private const val POLL_INTERVAL_MS = 200L
+        private const val VISIBLE_GUIDANCE_INTERVAL_MS = 1_800L
+        private const val REPEAT_SAME_COMMAND_AFTER_MS = 3_000L
+        private const val MIN_SPEECH_GAP_MS = 1_400L
 
-        /** How far (normalised Euclidean distance) a new detection can be from the
-         *  committed position before it is considered a "jump". */
-        private const val POSITION_JUMP_THRESHOLD     = 0.30f
-        /** How many consecutive far-away detections are needed before the commitment
-         *  switches to the new position. Filters brief false positives. */
-        private const val FAR_FRAMES_TO_SWITCH        = 10
+        private const val POSITION_JUMP_THRESHOLD = 0.30f
+        private const val FAR_FRAMES_TO_SWITCH = 3
+        private const val LOST_COMMIT_CLEAR_MS = 1_000L
+        private const val REQUIRED_ARRIVAL_FRAMES = 2
+        private const val REQUIRED_REJECTION_FRAMES = 3
+        private const val REJECTION_LOST_MS = 1_000L
+
+        private const val HIGH_FRAME_Y_THRESHOLD = 0.25f
+        private const val LOW_FRAME_Y_THRESHOLD = 0.58f
+        private const val SURFACE_Y_THRESHOLD = 0.58f
+
+        /*
+         * The camera does not know real distance from one image.
+         * These are rough "close enough to reach" area guesses for each object.
+         */
+        private const val WALLET_SURFACE_AREA = 0.025f
+        private const val SUNGLASSES_SURFACE_AREA = 0.018f
+        private const val KEYS_SURFACE_AREA = 0.008f
+        private const val DEFAULT_SURFACE_AREA = 0.018f
+
+        // Wait this long before suggesting movement when the target has not been seen.
+        private const val STATIONARY_HINT_AFTER_MS = 5_000L
+
+        // Wait longer before repeating the same stationary hint.
+        private const val STATIONARY_HINT_REPEAT_MS = 12_000L
+
+        /*
+         * Approximate horizontal camera view.
+         * Bearing maths uses this to turn frame position into a left/right angle.
+         */
+        private const val HORIZONTAL_FOV_DEG = 70f
+        private const val HORIZONTAL_FOV_RAD =
+            (HORIZONTAL_FOV_DEG * PI / 180.0).toFloat()
+
+        /*
+         * How long to trust a remembered bearing.
+         * Faster movement makes the memory expire sooner.
+         */
+        private const val BEARING_LIFETIME_STATIONARY_MS = 8_000L
+        private const val BEARING_LIFETIME_MOVING_MS = 4_000L
+        private const val BEARING_LIFETIME_TOO_FAST_MS = 2_000L
+
+        /*
+         * Repeat a bearing when the clock hour changes, or after this much silence.
+         */
+        private const val BEARING_REPEAT_MS = 2_500L
     }
 
     fun start(target: String) {
-        targetLabel  = target
-        everDetected = false
+        resetState(target)
+        searchStartedAtMs = System.currentTimeMillis()
         if (isRunning) return
+
         isRunning = true
         guidanceThread = Thread {
-            // Initial sweep instruction — give the "Searching for X" TTS time to finish first
-            try { Thread.sleep(2000) } catch (e: InterruptedException) { return@Thread }
-            if (isRunning && !everDetected) {
-                speak("Slowly sweep the camera around the room.")
-            }
-
+            /*
+             * Give MainActivity's "Searching for ..." message time to finish
+             * before detector guidance starts speaking.
+             */
+            sleepOrStop(INITIAL_GUIDANCE_DELAY_MS)
             while (isRunning) {
-                if (pendingFoundAnnouncement) {
-                    pendingFoundAnnouncement = false
-                    val snap = currentResult
-                    if (snap != null) {
-                        speak("Possible $targetLabel found.")
-                        try { Thread.sleep(GUIDANCE_INTERVAL_MS) } catch (e: InterruptedException) { break }
-                    }
-                    continue
-                }
-
-                val result = currentResult
-                when {
-                    result != null -> {
-                        speak(composeGuidance(result))
-                        try { Thread.sleep(GUIDANCE_INTERVAL_MS) } catch (e: InterruptedException) { break }
-                    }
-                    !everDetected -> {
-                        // Sweep instruction already given once at start — wait silently.
-                        try { Thread.sleep(SWEEP_REMINDER_INTERVAL_MS) } catch (e: InterruptedException) { break }
-                    }
-                    !lostSightAnnounced -> {
-                        // Object just left the frame — announce once, then stay silent.
-                        lostSightAnnounced = true
-                        val last = lastConfirmedResult
-                        if (isConfirmed && last != null) speak(composeOutOfViewGuidance(last))
-                        else speak("Lost sight of $targetLabel. Keep searching.")
-                        try { Thread.sleep(GUIDANCE_INTERVAL_MS) } catch (e: InterruptedException) { break }
-                    }
-                    else -> {
-                        // Already announced the loss — wait silently for a re-detection.
-                        try { Thread.sleep(GUIDANCE_INTERVAL_MS) } catch (e: InterruptedException) { break }
-                    }
-                }
+                speakIfDue(System.currentTimeMillis())
+                sleepOrStop(POLL_INTERVAL_MS)
             }
-        }.also { it.isDaemon = true; it.start() }
+        }.also {
+            it.isDaemon = true
+            it.start()
+        }
     }
 
     fun stop() {
         isRunning = false
         guidanceThread?.interrupt()
         guidanceThread = null
+        resetState("")
+    }
+
+    /*
+     * Receives real detector updates.
+     * Pass null when the target is not visible.
+     */
+    fun update(result: DetectionResult?) {
+        update(result, System.currentTimeMillis())
+    }
+
+    /*
+     * Stores the latest movement state.
+     * The speech loop reads this when deciding pace guidance.
+     */
+    fun updateMotion(state: MotionDetector.MotionState) {
+        motionState = state
+    }
+
+    /*
+     * Stores the latest yaw reading.
+     * NaN means orientation guidance is unavailable.
+     */
+    fun updateOrientation(yawRadians: Float) {
+        currentYawRad = yawRadians
+    }
+
+    private fun update(result: DetectionResult?, now: Long) {
+        if (result == null) {
+            currentResult = null
+            consecutiveFarFrames = 0
+            consecutiveCenteredLargeFrames = 0
+            consecutiveRejectableCloseFrames = 0
+            if (rejectableCandidateArmed && rejectableCandidateLostAtMs == 0L) {
+                rejectableCandidateLostAtMs = now
+            }
+            if (lastVisibleAtMs != 0L && now - lastVisibleAtMs > LOST_COMMIT_CLEAR_MS) {
+                committedX = Float.NaN
+                committedY = Float.NaN
+            }
+            return
+        }
+
+        val accepted = stabilized(result) ?: return
+        currentResult = accepted
+        lastVisibleAtMs = now
+        rejectableCandidateLostAtMs = 0L
+
+        /*
+         * Refresh bearing memory on every real detection.
+         * This memory is only used if the target later leaves the frame.
+         */
+        val yaw = currentYawRad
+        if (!yaw.isNaN()) {
+            bearingMemory = BearingMemory(yaw, accepted.normalizedX, now)
+            lastBearingSpokenHour = -1
+        }
+
+        consecutiveCenteredLargeFrames = if (isCentered(accepted) && isLargeEnough(targetLabel, accepted)) {
+            consecutiveCenteredLargeFrames + 1
+        } else {
+            0
+        }
+
+        if (isLargeEnough(targetLabel, accepted)) {
+            consecutiveRejectableCloseFrames++
+            if (consecutiveRejectableCloseFrames >= REQUIRED_REJECTION_FRAMES) {
+                rejectableCandidateArmed = true
+                rejectionSpokenForLostCandidate = false
+            }
+        } else {
+            consecutiveRejectableCloseFrames = 0
+            rejectableCandidateArmed = false
+            rejectionSpokenForLostCandidate = false
+        }
+    }
+
+    private fun speakIfDue(now: Long) {
+        val decision = currentGuidanceDecision(now) ?: return
+        val message = decision.message
+        val elapsed = now - lastSpokenAtMs
+
+        if (lastSpoken.isNotEmpty() && elapsed < MIN_SPEECH_GAP_MS) return
+
+        val requiredInterval = if (message == lastSpoken) {
+            REPEAT_SAME_COMMAND_AFTER_MS
+        } else {
+            VISIBLE_GUIDANCE_INTERVAL_MS
+        }
+
+        if (lastSpoken.isNotEmpty() && elapsed < requiredInterval) return
+
+        speak(message)
+        lastSpoken = message
+        lastSpokenAtMs = now
+        if (decision.phase == GuidancePhase.REJECTED) {
+            markRejectionSpoken()
+        }
+        if (decision.phase == GuidancePhase.BEARING_HINT && decision.bearingHour != null) {
+            lastBearingSpokenHour = decision.bearingHour
+            lastBearingSpokenAtMs = now
+        }
+        if (decision.phase == GuidancePhase.PACE_TOO_SLOW) {
+            lastPaceSlowSpokenAtMs = now
+        }
+    }
+
+    private fun currentGuidanceDecision(now: Long): GuidanceDecision? {
+        val result = currentResult
+        if (result != null) {
+            return decideVisibleGuidance(targetLabel, result, consecutiveCenteredLargeFrames)
+        }
+        val rejection = decideLostCandidateGuidance(now)
+        if (rejection != null) return rejection
+        val bearing = decideBearingHint(now)
+        if (bearing != null) return bearing
+        return decidePaceGuidance(now)
+    }
+
+    private fun decideBearingHint(now: Long): GuidanceDecision? {
+        val mem = bearingMemory ?: return null
+        val yaw = currentYawRad
+        if (yaw.isNaN()) return null
+        if (now - mem.storedAtMs > bearingMemoryLifetimeMs()) {
+            bearingMemory = null
+            lastBearingSpokenHour = -1
+            return null
+        }
+        val targetWorldYaw = mem.storedYawRad + (mem.storedFrameX - 0.5f) * HORIZONTAL_FOV_RAD
+        val relRad = wrapToPi(targetWorldYaw - yaw)
+        val hour = clockHourFromRadians(relRad)
+        val sameHour = hour == lastBearingSpokenHour
+        val elapsed = now - lastBearingSpokenAtMs
+        if (sameHour && elapsed < BEARING_REPEAT_MS) return null
+        return GuidanceDecision(
+            phase = GuidancePhase.BEARING_HINT,
+            message = bearingMessage(targetLabel, hour),
+            bearingHour = hour
+        )
+    }
+
+    private fun bearingMemoryLifetimeMs(): Long = when (motionState) {
+        MotionDetector.MotionState.STATIONARY -> BEARING_LIFETIME_STATIONARY_MS
+        MotionDetector.MotionState.MOVING -> BEARING_LIFETIME_MOVING_MS
+        MotionDetector.MotionState.MOVING_TOO_FAST -> BEARING_LIFETIME_TOO_FAST_MS
+    }
+
+    private fun bearingMessage(target: String, hour: Int): String {
+        val word = target.lowercase()
+            .replaceFirstChar { it.uppercase() }
+            .ifBlank { "Object" }
+        return "$word at $hour o'clock."
+    }
+
+    private fun wrapToPi(rad: Float): Float {
+        val twoPi = (2.0 * PI).toFloat()
+        var r = rad
+        while (r > PI) r -= twoPi
+        while (r < -PI) r += twoPi
+        return r
+    }
+
+    /*
+     * Converts an angle around the user into a clock hour.
+     * 0 radians means straight ahead, and positive angles move to the right.
+     */
+    private fun clockHourFromRadians(rad: Float): Int {
+        // Each clock hour represents 30 degrees.
+        val degrees = (rad * 180.0 / PI).toFloat()
+        val rawHour = (degrees / 30f).roundToInt()
+        // Move the range into 1..12, including negative angles.
+        return ((rawHour + 11) % 12) + 1
+    }
+
+    private fun decidePaceGuidance(now: Long): GuidanceDecision? {
+        if (targetLabel.isEmpty()) return null
+        return when (motionState) {
+            MotionDetector.MotionState.MOVING_TOO_FAST ->
+                GuidanceDecision(GuidancePhase.PACE_TOO_FAST, paceTooFastMessage())
+            MotionDetector.MotionState.STATIONARY -> {
+                val sinceVisible = if (lastVisibleAtMs == 0L) {
+                    now - searchStartedAtMs
+                } else {
+                    now - lastVisibleAtMs
+                }
+                val sinceLastHint = now - lastPaceSlowSpokenAtMs
+                val cooldownExpired =
+                    lastPaceSlowSpokenAtMs == 0L || sinceLastHint >= STATIONARY_HINT_REPEAT_MS
+                if (sinceVisible >= STATIONARY_HINT_AFTER_MS && cooldownExpired) {
+                    GuidanceDecision(GuidancePhase.PACE_TOO_SLOW, paceTooSlowMessage(targetLabel))
+                } else {
+                    null
+                }
+            }
+            MotionDetector.MotionState.MOVING -> null
+        }
+    }
+
+    private fun paceTooFastMessage(): String =
+        "Slow down. Move the phone more steadily."
+
+    private fun paceTooSlowMessage(target: String): String {
+        val lower = target.lowercase()
+        return if (lower.isBlank()) {
+            "Try moving around to search."
+        } else {
+            "Try moving around to search for the $lower."
+        }
+    }
+
+    private fun stabilized(result: DetectionResult): DetectionResult? {
+        if (committedX.isNaN()) {
+            committedX = result.normalizedX
+            committedY = result.normalizedY
+            consecutiveFarFrames = 0
+            return result
+        }
+
+        val dist = sqrt(
+            (result.normalizedX - committedX).pow(2) +
+                (result.normalizedY - committedY).pow(2)
+        )
+
+        if (dist > POSITION_JUMP_THRESHOLD) {
+            consecutiveFarFrames++
+            if (consecutiveFarFrames < FAR_FRAMES_TO_SWITCH) return null
+
+            committedX = result.normalizedX
+            committedY = result.normalizedY
+            consecutiveFarFrames = 0
+            return result
+        }
+
+        consecutiveFarFrames = 0
+        committedX = committedX * 0.8f + result.normalizedX * 0.2f
+        committedY = committedY * 0.8f + result.normalizedY * 0.2f
+        return result.copy(normalizedX = committedX, normalizedY = committedY)
+    }
+
+    private fun sleepOrStop(ms: Long) {
+        try {
+            Thread.sleep(ms)
+        } catch (e: InterruptedException) {
+            isRunning = false
+        }
+    }
+
+    private fun resetState(target: String) {
+        targetLabel = target
         currentResult = null
-        pendingFoundAnnouncement = false
-        everDetected = false
-        isConfirmed = false
-        lastConfirmedResult = null
-        lostSightAnnounced = false
+        consecutiveCenteredLargeFrames = 0
+        consecutiveRejectableCloseFrames = 0
+        lastVisibleAtMs = 0L
+        rejectableCandidateArmed = false
+        rejectableCandidateLostAtMs = 0L
+        rejectionSpokenForLostCandidate = false
         committedX = Float.NaN
         committedY = Float.NaN
         consecutiveFarFrames = 0
+        lastSpoken = ""
+        lastSpokenAtMs = 0L
+        motionState = MotionDetector.MotionState.MOVING
+        searchStartedAtMs = 0L
+        bearingMemory = null
+        lastBearingSpokenHour = -1
+        lastBearingSpokenAtMs = 0L
+        lastPaceSlowSpokenAtMs = 0L
+        /*
+         * currentYawRad is a live sensor reading, not search state.
+         * Bearing memory is cleared, so old yaw alone cannot create guidance.
+         */
     }
 
-    /**
-     * Call from the detection callback every frame. Pass null when the target
-     * is not visible. Applies commitment filtering — a detection far from the
-     * committed position is suppressed unless it persists.
-     */
-    fun update(result: DetectionResult?) {
-        if (result != null) {
-            // ── Commitment filtering ─────────────────────────────────────
-            if (!committedX.isNaN()) {
-                val dist = sqrt(
-                    (result.normalizedX - committedX).pow(2) +
-                    (result.normalizedY - committedY).pow(2)
-                )
-                if (dist > POSITION_JUMP_THRESHOLD) {
-                    consecutiveFarFrames++
-                    if (consecutiveFarFrames < FAR_FRAMES_TO_SWITCH) {
-                        // Suppress this detection — keep guiding to committed position
-                        return
-                    }
-                    // Enough consecutive far frames — accept the new position
-                    committedX = result.normalizedX
-                    committedY = result.normalizedY
-                    consecutiveFarFrames = 0
-                } else {
-                    // Near committed position — smooth-update the commitment
-                    consecutiveFarFrames = 0
-                    committedX = committedX * 0.8f + result.normalizedX * 0.2f
-                    committedY = committedY * 0.8f + result.normalizedY * 0.2f
-                }
-            }
+    // Testable guidance helpers used without starting the speech thread.
 
-            // ── Normal update logic ──────────────────────────────────────
-            if (currentResult == null) {
-                pendingFoundAnnouncement = true
-                if (!everDetected) everDetected = true
-                lostSightAnnounced = false  // Object reappeared — allow lost-sight to fire again next time
-            }
-            if (result.confidence >= CONFIRMATION_THRESHOLD) {
-                isConfirmed = true
-                lastConfirmedResult = result
-                // Set initial commitment on first confirmed detection
-                if (committedX.isNaN()) {
-                    committedX = result.normalizedX
-                    committedY = result.normalizedY
-                }
-            }
-        } else {
-            consecutiveFarFrames = 0
+    internal fun decideVisibleGuidance(
+        target: String,
+        result: DetectionResult,
+        centeredLargeFrames: Int = REQUIRED_ARRIVAL_FRAMES
+    ): GuidanceDecision {
+        val centered = isCentered(result)
+
+        if (!centered) {
+            return GuidanceDecision(GuidancePhase.ALIGNING, alignmentMessage(target, result))
         }
-        currentResult = result
+
+        if (isLikelySurfaceReach(target, result)) {
+            return GuidanceDecision(GuidancePhase.SURFACE, surfaceReachMessage(target))
+        }
+
+        val arrived = isLargeEnough(target, result) && centeredLargeFrames >= REQUIRED_ARRIVAL_FRAMES
+        if (arrived) {
+            return GuidanceDecision(GuidancePhase.ARRIVED, arrivedMessage(target))
+        }
+
+        return GuidanceDecision(GuidancePhase.APPROACHING, centeredApproachMessage(result))
     }
 
-    // ── Guidance helpers ──────────────────────────────────────────────────────
+    internal fun guidanceForTesting(
+        target: String,
+        result: DetectionResult,
+        centeredLargeFrames: Int = REQUIRED_ARRIVAL_FRAMES
+    ): String = decideVisibleGuidance(target, result, centeredLargeFrames).message
 
-    /**
-     * Map horizontal position to a clock hour on the **forward arc only** (9→12→3).
-     * normalizedX 0.0 = 9 o'clock (far left), 0.5 = 12 (ahead), 1.0 = 3 o'clock (far right).
-     * Returns "directly ahead" when the object is near the horizontal centre.
-     */
+    internal fun currentGuidanceForTesting(
+        target: String,
+        now: Long = System.currentTimeMillis()
+    ): String? {
+        targetLabel = target
+        return currentGuidanceDecision(now)?.message
+    }
+
+    internal fun resetForTesting(target: String) {
+        resetState(target)
+    }
+
+    internal fun setCurrentResultForTesting(
+        result: DetectionResult?,
+        centeredLargeFrames: Int = 0
+    ) {
+        currentResult = result
+        consecutiveCenteredLargeFrames = centeredLargeFrames
+    }
+
+    internal fun tickForTesting(now: Long) {
+        speakIfDue(now)
+    }
+
+    internal fun updateForTesting(result: DetectionResult?, now: Long) {
+        update(result, now)
+    }
+
+    internal fun updateMotionForTesting(state: MotionDetector.MotionState) {
+        motionState = state
+    }
+
+    internal fun setSearchStartedAtForTesting(now: Long) {
+        searchStartedAtMs = now
+    }
+
+    internal fun updateOrientationForTesting(yawRad: Float) {
+        currentYawRad = yawRad
+    }
+
+    internal fun setBearingMemoryForTesting(yawRad: Float, frameX: Float, atMs: Long) {
+        bearingMemory = BearingMemory(yawRad, frameX, atMs)
+        lastBearingSpokenHour = -1
+        lastBearingSpokenAtMs = 0L
+    }
+
+    private fun alignmentMessage(target: String, result: DetectionResult): String {
+        // This is only called when the target is clearly left or right of centre.
+        val direction = if (result.normalizedX < 0.35f) "left" else "right"
+        val horizontal = horizontalPanMessage(result, direction)
+        return appendSurfaceHint(target, horizontal, result)
+    }
+
+    private fun centeredApproachMessage(result: DetectionResult): String {
+        /*
+         * The target is already roughly centred.
+         * Give one next action instead of saying "centred" out loud.
+         */
+        return when {
+            result.normalizedY < HIGH_FRAME_Y_THRESHOLD -> "Pan phone up slowly."
+            result.normalizedY > LOW_FRAME_Y_THRESHOLD -> "Pan phone down slowly."
+            else -> "Move forward slowly."
+        }
+    }
+
+    private fun arrivedMessage(target: String): String {
+        val lowerTarget = target.lowercase()
+        val displayTarget = lowerTarget.replaceFirstChar { it.uppercase() }
+        return when {
+            displayTarget.isBlank() -> "Stop. Object is in front of you."
+            lowerTarget == "keys" || lowerTarget == "sunglasses" ->
+                "Stop. $displayTarget are in front of you."
+            else -> "Stop. $displayTarget is in front of you."
+        }
+    }
+
+    private fun decideLostCandidateGuidance(now: Long): GuidanceDecision? {
+        if (!rejectableCandidateArmed) return null
+        if (rejectionSpokenForLostCandidate) return null
+        if (rejectableCandidateLostAtMs == 0L) return null
+        if (now - rejectableCandidateLostAtMs < REJECTION_LOST_MS) return null
+        return GuidanceDecision(GuidancePhase.REJECTED, rejectionMessage(targetLabel))
+    }
+
+    private fun markRejectionSpoken() {
+        rejectionSpokenForLostCandidate = true
+        rejectableCandidateArmed = false
+        rejectableCandidateLostAtMs = 0L
+        consecutiveRejectableCloseFrames = 0
+    }
+
+    private fun rejectionMessage(target: String): String {
+        return when (target.lowercase()) {
+            "keys" -> "Sorry, those are not the keys. Keep searching."
+            "sunglasses" -> "Sorry, those are not the sunglasses. Keep searching."
+            "wallet" -> "Sorry, that is not the wallet. Keep searching."
+            else -> "Sorry, that is not the object. Keep searching."
+        }
+    }
+
+    private fun isLikelySurfaceReach(target: String, result: DetectionResult): Boolean {
+        return isCentered(result) &&
+            result.normalizedY >= SURFACE_Y_THRESHOLD &&
+            result.normalizedArea >= surfaceAreaThreshold(target)
+    }
+
+    private fun surfaceReachMessage(target: String): String {
+        val displayTarget = target.lowercase().replaceFirstChar { it.uppercase() }
+        val targetText = displayTarget.ifBlank { "Object" }
+        return "$targetText on surface in front of you. Reach ahead."
+    }
+
+    private fun horizontalPanMessage(result: DetectionResult, direction: String): String {
+        val vertical = when {
+            result.normalizedY < HIGH_FRAME_Y_THRESHOLD -> " and up"
+            result.normalizedY > LOW_FRAME_Y_THRESHOLD -> " and down"
+            else -> ""
+        }
+        return "${toClockHour(result.normalizedX)}. Pan phone $direction$vertical slowly."
+    }
+
+    private fun appendSurfaceHint(target: String, message: String, result: DetectionResult): String {
+        return if (isLikelySurfaceProximity(target, result)) "$message Surface ahead." else message
+    }
+
     private fun toClockHour(normalizedX: Float): String {
-        if (abs(normalizedX - 0.5f) < 0.15f) return "directly ahead"
-        // Linear map: 0→9, 0.5→12, 1→3  (i.e. hours = normalizedX * 6 + 9, mod 12)
+        if (abs(normalizedX - 0.5f) < 0.05f) return "12 o'clock"
         val rawHour = (normalizedX * 6f + 9f).roundToInt()
         val hour = (rawHour % 12).let { if (it == 0) 12 else it }
         return "$hour o'clock"
     }
 
-    private fun toProximity(normalizedArea: Float): String = when {
-        normalizedArea < 0.03f -> "keep walking forward"
-        normalizedArea < 0.08f -> "getting closer"
-        normalizedArea < 0.15f -> "within arm's reach"
-        else                   -> "right in front of you"
+    private fun isCentered(result: DetectionResult): Boolean {
+        /*
+         * Treat the middle 30 percent of the frame as centred.
+         * This avoids noisy tiny left/right corrections.
+         */
+        return result.normalizedX in 0.35f..0.65f
     }
 
-    /**
-     * Vertical/surface cue based on where the object sits in the frame.
-     *
-     * Lower-frame detections mean the object is on a surface below the camera —
-     * the user needs "reach down" / "on the surface" guidance, not a clock hour.
-     * Returns null when no special vertical cue is needed.
-     */
-    private fun toVerticalCue(normalizedX: Float, normalizedY: Float, normalizedArea: Float): String? {
-        if (normalizedY < 0.15f) return "above you"
-
-        // Object near the very bottom of frame — urgent, about to leave view
-        if (normalizedY > 0.85f) return "right below you, point your phone down"
-
-        // Object in lower portion and within reach — give surface-level guidance
-        if (normalizedY > 0.70f && normalizedArea >= 0.08f) {
-            val side = when {
-                normalizedX < 0.35f -> "to your left"
-                normalizedX > 0.65f -> "to your right"
-                else                -> "right in front of you"
-            }
-            return "on the surface $side"
-        }
-
-        // Object in lower third but still far away — gentle hint
-        if (normalizedY > 0.70f) return "below you"
-
-        return null
+    private fun isLargeEnough(target: String, result: DetectionResult): Boolean {
+        return result.normalizedArea >= arrivalAreaThreshold(target)
     }
 
-    /** Compose a natural-language guidance sentence for an active detection. */
-    private fun composeGuidance(result: DetectionResult): String {
-        val clock       = toClockHour(result.normalizedX)
-        val proximity   = toProximity(result.normalizedArea)
-        val verticalCue = toVerticalCue(result.normalizedX, result.normalizedY, result.normalizedArea)
-
-        // When the object is in the lower part of the frame and close, the vertical/surface
-        // cue is more useful than the clock direction — lead with it.
-        if (verticalCue != null && result.normalizedY > 0.70f && result.normalizedArea >= 0.08f) {
-            return "$targetLabel $verticalCue. ${proximity.replaceFirstChar { it.uppercase() }}."
-        }
-
-        val directionPhrase = if (clock == "directly ahead") "$targetLabel directly ahead"
-                              else "$targetLabel at $clock"
-
-        val locationPart = if (verticalCue != null) "$directionPhrase, $verticalCue"
-                           else directionPhrase
-
-        return "$locationPart. ${proximity.replaceFirstChar { it.uppercase() }}."
+    private fun isLikelySurfaceProximity(target: String, result: DetectionResult): Boolean {
+        return result.normalizedY >= SURFACE_Y_THRESHOLD &&
+            result.normalizedArea >= surfaceAreaThreshold(target)
     }
 
-    /** Compose guidance when the object was recently visible but is now out of frame. */
-    private fun composeOutOfViewGuidance(lastResult: DetectionResult): String {
-        val clock       = toClockHour(lastResult.normalizedX)
-        val verticalCue = toVerticalCue(lastResult.normalizedX, lastResult.normalizedY, lastResult.normalizedArea)
-
-        // If the object was below/on surface when lost, prioritise that info
-        if (verticalCue != null && lastResult.normalizedY > 0.70f) {
-            return "$targetLabel lost. It was $verticalCue."
+    private fun arrivalAreaThreshold(target: String): Float {
+        return when (target.lowercase()) {
+            "keys" -> 0.035f
+            "sunglasses" -> 0.065f
+            "wallet" -> 0.075f
+            else -> 0.065f
         }
+    }
 
-        return if (clock == "directly ahead") {
-            if (verticalCue != null) "$targetLabel lost, was $verticalCue."
-            else "$targetLabel lost. It was straight ahead."
-        } else {
-            if (verticalCue != null) "$targetLabel lost. Try $clock, $verticalCue."
-            else "$targetLabel lost. Try $clock."
+    private fun surfaceAreaThreshold(target: String): Float {
+        return when (target.lowercase()) {
+            "keys" -> KEYS_SURFACE_AREA
+            "sunglasses" -> SUNGLASSES_SURFACE_AREA
+            "wallet" -> WALLET_SURFACE_AREA
+            else -> DEFAULT_SURFACE_AREA
         }
     }
 }

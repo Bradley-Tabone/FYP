@@ -2,44 +2,28 @@ package com.example.findme
 
 import kotlin.math.abs
 
-/**
- * Single-target temporal smoother with constant-velocity occlusion bridging.
- *
- * Sits between the raw detector callback and MainActivity's UI/audio update.
- * Replaces the simple `MISS_HOLD_FRAMES` freeze with:
- *   - position EMA on hits  → smooths jitter, no popping when detection returns
- *   - velocity estimate     → predicted box keeps moving with the camera/object during a miss
- *   - confidence decay      → predictions self-expire after roughly 12 frames (~330 ms @ 30 fps)
- *
- * Why not a Kalman filter / SORT / ByteTrack: those are designed for multi-target
- * tracking with re-identification. We only ever track one target (the user's spoken
- * choice), so the matrix machinery is pure overhead. ~5 floats of state, sub-ms cost.
- *
- * Limitations (worth raising in the meeting):
- *   - Bridges short occlusions only (under ~½ second). Anything longer falls below
- *     CONF_FLOOR and the tracker resets — by design.
- *   - Assumes roughly linear short-term motion. Sudden direction changes during the
- *     occlusion gap mis-predict, but the confidence decay catches that quickly.
- *   - This is a UX smoother, not a model improvement. mAP numbers don't change.
- */
+ /*
+  * Smooths the target box over time.
+ * The detector can sometimes flicker or jump between frames, so this class
+  * remembers the last target and briefly predicts where it should be during
+  * very short missed detections.
+  */
 class TargetTracker {
 
     companion object {
-        /** EMA weight on the previous position when a new detection arrives.
-         *  0 = snap to detection (no smoothing); 1 = ignore detection (infinite lag). */
+        // How much the previous position affects the next smoothed position.
         private const val POS_EMA = 0.6f
 
-        /** EMA weight on previous velocity. Higher = smoother but laggier velocity. */
+        // How much the previous velocity affects the next velocity estimate.
         private const val VEL_EMA = 0.7f
 
-        /** Multiplier applied to confidence on every miss. 0.85^12 ≈ 0.14. */
+        // Confidence is multiplied by this every time the detector misses.
         private const val CONF_DECAY = 0.85f
 
-        /** Below this confidence the tracker gives up and reports null. */
+        // If confidence drops below this value, the tracker gives up.
         private const val CONF_FLOOR = 0.15f
 
-        /** Cap |vx|, |vy| (frame-fractions per tick) so a noisy detection at the
-         *  screen edge can't fling the predicted box across the frame. */
+        // Maximum movement allowed per frame, to avoid wild jumps from one bad detection.
         private const val MAX_VEL = 0.05f
     }
 
@@ -47,23 +31,23 @@ class TargetTracker {
     private var vx = 0f; private var vy = 0f
     private var conf = 0f
 
-    /** Last seen box dimensions — held constant during prediction. */
+    // Last known box size. Kept the same during short predictions.
     private var w = 0f; private var h = 0f
     private var area = 0f
 
-    /** Last detection's metadata that we propagate through during predicted frames. */
+    // Extra information copied from the last real detection.
     private var label = ""
     private var sourceW = 0; private var sourceH = 0
 
     private var hasLock = false
 
-    /**
-     * Called when the detector returned a real detection this frame.
-     * Updates EMA position, refreshes velocity from the observed delta, resets confidence.
+    /*
+     * Called when the detector finds the target.
+     * Updates position, velocity, confidence, and box information.
      */
-    fun onHit(d: DetectorContract.DetectionResult) {
+    fun onHit(d: DetectorTypes.DetectionResult) {
         if (!hasLock) {
-            // First detection — anchor without smoothing, zero velocity.
+            // First detection: store it directly because there is nothing to smooth yet.
             x = d.normalizedX; y = d.normalizedY
             vx = 0f; vy = 0f
         } else {
@@ -83,13 +67,11 @@ class TargetTracker {
         hasLock = true
     }
 
-    /**
-     * Called when the detector returned null this frame.
-     * Advances the predicted position by the current velocity and decays confidence.
-     * Returns a predicted DetectionResult while confidence is still above CONF_FLOOR,
-     * or null once the tracker has given up (caller should clear the overlay).
+    /*
+     * Called when the detector does not find the target.
+     * Predicts the next position briefly, then gives up if confidence gets too low.
      */
-    fun onMiss(): DetectorContract.DetectionResult? {
+    fun onMiss(): DetectorTypes.DetectionResult? {
         if (!hasLock) return null
 
         x = (x + vx).coerceIn(0f, 1f)
@@ -101,8 +83,7 @@ class TargetTracker {
             return null
         }
 
-        // Damp velocity slightly during prediction — without a corrective observation,
-        // we shouldn't keep accelerating in the assumed direction forever.
+        // Slow the prediction down slightly because we are guessing without a real detection.
         vx *= 0.95f; vy *= 0.95f
         if (abs(vx) < 1e-4f) vx = 0f
         if (abs(vy) < 1e-4f) vy = 0f
@@ -110,10 +91,10 @@ class TargetTracker {
         return current()
     }
 
-    /** Snapshot of the tracker's current best estimate, formatted as a DetectionResult. */
-    fun current(): DetectorContract.DetectionResult? {
+    // Return the current smoothed or predicted target as a DetectionResult.
+    fun current(): DetectorTypes.DetectionResult? {
         if (!hasLock) return null
-        return DetectorContract.DetectionResult(
+        return DetectorTypes.DetectionResult(
             label          = label,
             confidence     = conf,
             normalizedX    = x,

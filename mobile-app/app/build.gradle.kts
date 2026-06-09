@@ -18,6 +18,10 @@ android {
         versionName = "1.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
+        // Strip x86/armeabi-v7a native libs — this app targets real Android phones only.
+        // Reduces APK size by ~60% of native-lib weight (arm64-v8a is all modern devices).
+        ndk { abiFilters += listOf("arm64-v8a") }
     }
 
     buildTypes {

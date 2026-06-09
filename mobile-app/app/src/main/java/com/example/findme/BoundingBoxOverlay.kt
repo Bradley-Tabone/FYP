@@ -9,26 +9,20 @@ import android.util.AttributeSet
 import android.view.View
 import kotlin.math.sqrt
 
-/**
- * Transparent overlay drawn on top of the camera preview.
- * Renders a bounding box and confidence label for the current detection result.
- * Non-interactive — touch events pass through to the button beneath.
- *
- * Call [updateDetection] from the main thread with each new [DetectorContract.DetectionResult]
- * (or null to clear). When normalizedW/H are provided the actual box shape is drawn;
- * otherwise falls back to a square approximation from centre-point + area.
- *
- * The overlay accounts for PreviewView's FILL_CENTER scaling by using the source
- * frame dimensions (sourceW/sourceH) from the detection result to compute the
- * crop offset. This ensures the bounding box aligns with the visible preview.
+/*
+ * Transparent view placed over the camera preview.
+ * It does not detect objects itself. It only draws the latest DetectionResult
+ * as a green box with a confidence label.
  */
 class BoundingBoxOverlay @JvmOverloads constructor(
     context: Context,
     attrs: AttributeSet? = null
 ) : View(context, attrs) {
 
-    private var detection: DetectorContract.DetectionResult? = null
+    // Current detection to draw. Null means no box is shown.
+    private var detection: DetectorTypes.DetectionResult? = null
 
+    // Styling for the green box outline.
     private val boxPaint = Paint().apply {
         color = Color.GREEN
         style = Paint.Style.STROKE
@@ -36,19 +30,24 @@ class BoundingBoxOverlay @JvmOverloads constructor(
         isAntiAlias = true
     }
 
+    // Styling for the green label text.
     private val labelPaint = Paint().apply {
         color = Color.GREEN
         textSize = 48f
         isAntiAlias = true
     }
 
+    // Styling for the dark background behind the label.
     private val labelBgPaint = Paint().apply {
         color = Color.argb(160, 0, 0, 0)
         style = Paint.Style.FILL
     }
 
-    /** Update the displayed detection. Pass null to clear the overlay. Must be called on the main thread. */
-    fun updateDetection(result: DetectorContract.DetectionResult?) {
+    // Reused rectangle used to measure how much space the label text needs.
+    private val textBounds = Rect()
+
+    // Store the new detection and ask Android to redraw this view.
+    fun updateDetection(result: DetectorTypes.DetectionResult?) {
         detection = result
         invalidate()
     }
@@ -60,14 +59,15 @@ class BoundingBoxOverlay @JvmOverloads constructor(
         val viewW = width.toFloat()
         val viewH = height.toFloat()
 
-        // Use actual box width/height when available; fall back to square approximation.
+        // Use the real box width and height if the detection has them.
         val bw = if (result.normalizedW > 0f) result.normalizedW else sqrt(result.normalizedArea)
         val bh = if (result.normalizedH > 0f) result.normalizedH else sqrt(result.normalizedArea)
 
-        // Compute FILL_CENTER crop offset.
-        // PreviewView scales the camera frame to fill the view and crops the excess.
-        // Model coordinates are in [0,1] of the full frame, but the view only shows
-        // the cropped centre. We map frame-normalised coords to view pixels correctly.
+        /*
+         * The detection position is stored as normalized camera coordinates from 0 to 1.
+         * Android drawing needs real screen pixels, so the code below converts the
+         * detection box into left, top, right, and bottom pixel positions.
+         */
         val left:   Float
         val top:    Float
         val right:  Float
@@ -77,17 +77,17 @@ class BoundingBoxOverlay @JvmOverloads constructor(
             val frameAspect = result.sourceW.toFloat() / result.sourceH
             val viewAspect  = viewW / viewH
             val scale: Float
-            val ox: Float   // horizontal crop offset in view pixels
-            val oy: Float   // vertical   crop offset in view pixels
+            val ox: Float
+            val oy: Float
 
             if (frameAspect > viewAspect) {
-                // Frame is wider than view → scaled to fill height, crop left/right
+                // Wider frame: fill the view height and account for left/right cropping.
                 scale = viewH / result.sourceH
                 val scaledW = result.sourceW * scale
                 ox = (scaledW - viewW) / 2f
                 oy = 0f
             } else {
-                // Frame is taller than view → scaled to fill width, crop top/bottom
+                // Taller frame: fill the view width and account for top/bottom cropping.
                 scale = viewW / result.sourceW
                 val scaledH = result.sourceH * scale
                 ox = 0f
@@ -97,13 +97,13 @@ class BoundingBoxOverlay @JvmOverloads constructor(
             val scaledFrameW = result.sourceW * scale
             val scaledFrameH = result.sourceH * scale
 
-            // Map normalised frame coords → view pixels
+            // Convert normalized frame coordinates into visible screen pixels.
             left   = ((result.normalizedX - bw / 2f) * scaledFrameW - ox).coerceIn(0f, viewW)
             top    = ((result.normalizedY - bh / 2f) * scaledFrameH - oy).coerceIn(0f, viewH)
             right  = ((result.normalizedX + bw / 2f) * scaledFrameW - ox).coerceIn(0f, viewW)
             bottom = ((result.normalizedY + bh / 2f) * scaledFrameH - oy).coerceIn(0f, viewH)
         } else {
-            // Fallback: no source dimensions → assume 1:1 mapping (legacy behaviour)
+            // Fallback if the detection does not include the original camera frame size.
             left   = (result.normalizedX - bw / 2f).coerceIn(0f, 1f) * viewW
             top    = (result.normalizedY - bh / 2f).coerceIn(0f, 1f) * viewH
             right  = (result.normalizedX + bw / 2f).coerceIn(0f, 1f) * viewW
@@ -112,11 +112,10 @@ class BoundingBoxOverlay @JvmOverloads constructor(
 
         canvas.drawRect(left, top, right, bottom, boxPaint)
 
-        val label = "${result.label} ${"%.0f".format(result.confidence * 100)}%"
-        val textBounds = Rect()
+        val label = "${result.label} ${(result.confidence * 100).toInt()}%"
         labelPaint.getTextBounds(label, 0, label.length, textBounds)
 
-        // Place label above the box; fall back to below if the box is near the top edge.
+        // Place the label above the box, unless the box is too close to the top.
         val labelY = if (top > textBounds.height() + 12f) top - 8f
                      else bottom + textBounds.height() + 8f
 
